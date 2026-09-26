@@ -23,6 +23,11 @@ const COMPACT_BATCH_SIZE: i64 = 1000;
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const COMPACT_INTERVAL: Duration = Duration::from_secs(300);
 
+/// etcd v2 init_dir placeholder value. APISIX uses directory markers
+/// (key="/apisix/routes/", value="init_dir") to distinguish directories.
+/// These are not real data and must be excluded from query results.
+const INIT_DIR_MARKER: &[u8] = b"init_dir";
+
 /// Configuration for the PostgreSQL backend.
 #[derive(Debug, Clone)]
 pub struct PostgresConfig {
@@ -230,12 +235,15 @@ impl PostgresBackend {
     ) -> Result<(i64, Option<Event>)> {
         let escaped = key.replace('_', "^_");
         let (rev, events) = self
-            .list_internal(&escaped, "", 1, revision, include_deleted, keys_only)
+            .list_internal(&escaped, "", 1, revision, include_deleted, keys_only, false)
             .await?;
         Ok((rev, events.into_iter().next()))
     }
 
     /// Core list query using PostgreSQL's DISTINCT ON for efficient latest-version lookups.
+    ///
+    /// `filter_init_dir`: when true, excludes etcd v2 init_dir placeholder records.
+    /// List/count queries pass true; get_internal (used by create/delete/update) passes false.
     async fn list_internal(
         &self,
         prefix: &str,
@@ -244,6 +252,7 @@ impl PostgresBackend {
         revision: i64,
         include_deleted: bool,
         keys_only: bool,
+        filter_init_dir: bool,
     ) -> Result<(i64, Vec<Event>)> {
         let value_cols = if keys_only {
             ""
@@ -271,6 +280,17 @@ impl PostgresBackend {
 
         // Use DISTINCT ON (name) to get the latest version of each key efficiently.
         // This is the Postgres-specific optimization that kine uses.
+        //
+        // Filter out etcd v2 init_dir placeholder records at the SQL level.
+        // The init_dir parameter number depends on whether start_key is bound:
+        //   - bind_start_key=true  → $1=prefix, $2=start_key, $3=include_deleted, $4=init_dir
+        //   - bind_start_key=false → $1=prefix, $2=include_deleted, $3=init_dir
+        let init_dir_filter = if filter_init_dir {
+            let param = if bind_start_key { 4 } else { 3 };
+            format!("AND (kv.value IS NULL OR kv.value != ${param})")
+        } else {
+            String::new()
+        };
         let sql = format!(
             "SELECT
                 (SELECT MAX(rkv.id) FROM kine AS rkv),
@@ -289,6 +309,7 @@ impl PostgresBackend {
                 FROM kine AS kv
                 WHERE kv.name LIKE $1 ESCAPE '^'
                 {extra_where}
+                {init_dir_filter}
                 ORDER BY kv.name, theid DESC
             ) AS maxkv
             WHERE maxkv.deleted = 0 OR ${}
@@ -300,18 +321,20 @@ impl PostgresBackend {
         let include_deleted_val: bool = include_deleted;
 
         let rows = if bind_start_key {
-            sqlx::query(&sql)
+            let mut q = sqlx::query(&sql)
                 .bind(prefix)
                 .bind(start_key)
-                .bind(include_deleted_val)
-                .fetch_all(&self.pool)
-                .await
+                .bind(include_deleted_val);
+            if filter_init_dir {
+                q = q.bind(INIT_DIR_MARKER);
+            }
+            q.fetch_all(&self.pool).await
         } else {
-            sqlx::query(&sql)
-                .bind(prefix)
-                .bind(include_deleted_val)
-                .fetch_all(&self.pool)
-                .await
+            let mut q = sqlx::query(&sql).bind(prefix).bind(include_deleted_val);
+            if filter_init_dir {
+                q = q.bind(INIT_DIR_MARKER);
+            }
+            q.fetch_all(&self.pool).await
         }
         .map_err(|e| BackendError::Internal(e.to_string()))?;
 
@@ -370,6 +393,7 @@ impl PostgresBackend {
                 kv.old_value
             FROM kine AS kv
             WHERE kv.name LIKE $1 ESCAPE '^' AND kv.id > $2
+            AND (kv.value IS NULL OR kv.value != $3)
             ORDER BY kv.id ASC
             {limit_clause}"
         );
@@ -377,6 +401,7 @@ impl PostgresBackend {
         let rows = sqlx::query(&sql)
             .bind(prefix)
             .bind(revision)
+            .bind(INIT_DIR_MARKER)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| BackendError::Internal(e.to_string()))?;
@@ -722,10 +747,14 @@ impl Backend for PostgresBackend {
     }
 
     async fn create(&self, key: &str, value: &[u8], lease: i64) -> Result<i64> {
+        // get_internal uses filter_init_dir=false so init_dir markers are visible.
         let (_rev, existing) = self.get_internal(key, 0, true, false).await?;
 
+        // Treat init_dir placeholders as non-existent so APISIX can re-create them
+        // without triggering a unique constraint violation on (name, prev_revision).
         if let Some(ref event) = existing
             && !event.delete
+            && event.kv.value != INIT_DIR_MARKER
         {
             return Err(BackendError::KeyExists);
         }
@@ -834,6 +863,7 @@ impl Backend for PostgresBackend {
                 revision,
                 false,
                 keys_only,
+                true,
             )
             .await?;
 
@@ -851,7 +881,7 @@ impl Backend for PostgresBackend {
         let translated_start = translate_start_key(start_key);
 
         let (rev, events) = self
-            .list_internal(&like_prefix, &translated_start, 0, revision, false, true)
+            .list_internal(&like_prefix, &translated_start, 0, revision, false, true, true)
             .await?;
 
         Ok((rev, events.len() as i64))
@@ -946,11 +976,13 @@ impl Backend for PostgresBackend {
                         kv.old_value
                     FROM kine AS kv
                     WHERE kv.name LIKE $1 ESCAPE '^' AND kv.id > $2
+                    AND (kv.value IS NULL OR kv.value != $3)
                     ORDER BY kv.id ASC";
 
                 if let Ok(rows) = sqlx::query(sql)
                     .bind(&after_prefix)
                     .bind(start_rev)
+                    .bind(INIT_DIR_MARKER)
                     .fetch_all(&pool)
                     .await
                 {

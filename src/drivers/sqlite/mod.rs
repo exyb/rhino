@@ -26,6 +26,10 @@ const COMPACT_BATCH_SIZE: i64 = 1000;
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const COMPACT_INTERVAL: Duration = Duration::from_secs(300);
 
+/// etcd v2 compatibility: this value is stored as a placeholder for directory nodes.
+/// It should be filtered out from range query results.
+const INIT_DIR_MARKER: &[u8] = b"init_dir";
+
 /// Configuration for the SQLite backend.
 #[derive(Debug, Clone)]
 pub struct SqliteConfig {
@@ -73,7 +77,11 @@ impl Broadcaster {
     /// Large buffer prevents subscriber drops during transient query latency spikes.
     async fn subscribe(&self) -> mpsc::Receiver<Arc<Vec<Event>>> {
         let (tx, rx) = mpsc::channel(1000);
-        self.subscribers.lock().await.push(tx);
+        let mut subs = self.subscribers.lock().await;
+        subs.push(tx);
+        let sub_count = subs.len();
+        drop(subs);
+        tracing::info!("WATCH subscriber added: total_subscribers={}", sub_count);
         rx
     }
 
@@ -82,6 +90,14 @@ impl Broadcaster {
     async fn send(&self, events: Vec<Event>) {
         let events = Arc::new(events);
         let mut subs = self.subscribers.lock().await;
+        let sub_count = subs.len();
+        if sub_count > 0 {
+            let event_summary: Vec<String> = events
+                .iter()
+                .map(|e| format!("{}({},rev={})", if e.delete { "DEL" } else { "PUT" }, e.kv.key, e.kv.mod_revision))
+                .collect();
+            tracing::info!("WATCH broadcast: {} events to {} subscribers: {}", events.len(), sub_count, event_summary.join(", "));
+        }
         subs.retain(|tx| match tx.try_send(Arc::clone(&events)) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -336,7 +352,7 @@ impl SqliteBackend {
     ) -> Result<(i64, Option<Event>)> {
         let escaped = key.replace('_', "^_");
         let (rev, events) = self
-            .list_internal(&escaped, "", 1, revision, include_deleted, keys_only)
+            .list_internal(&escaped, "", 1, revision, include_deleted, keys_only, false)
             .await?;
         Ok((rev, events.into_iter().next()))
     }
@@ -344,6 +360,10 @@ impl SqliteBackend {
     /// Core list query. Returns (current_revision, events).
     /// For current-revision queries (revision == 0), uses kine_current for O(keys) lookup.
     /// For historical queries (revision > 0), falls back to MAX(id) GROUP BY subquery.
+    ///
+    /// `filter_init_dir`: when true, excludes etcd v2 init_dir placeholder records.
+    /// List/count queries pass true; get_internal (used by create/delete/update) passes false
+    /// so init_dir markers are visible and can be handled correctly.
     async fn list_internal(
         &self,
         prefix: &str,
@@ -352,6 +372,7 @@ impl SqliteBackend {
         revision: i64,
         include_deleted: bool,
         keys_only: bool,
+        filter_init_dir: bool,
     ) -> Result<(i64, Vec<Event>)> {
         // Fetch revision metadata once upfront instead of per-row correlated subqueries.
         let current_rev = self.cached_revision().await?;
@@ -386,6 +407,14 @@ impl SqliteBackend {
                 "AND cur.name >= ?".to_string()
             };
 
+            // Filter out etcd v2 init_dir placeholder records at the SQL level.
+            // These are directory markers (value = 'init_dir'), not real data.
+            let init_dir_filter = if filter_init_dir {
+                "AND (kv.value IS NULL OR kv.value != ?)"
+            } else {
+                ""
+            };
+
             let sql = format!(
                 "SELECT
                     kv.id AS theid,
@@ -401,23 +430,23 @@ impl SqliteBackend {
                 WHERE cur.name LIKE ? ESCAPE '^'
                 {start_where}
                 AND (kv.deleted = 0 OR ?)
+                {init_dir_filter}
                 ORDER BY kv.name ASC
                 {limit_clause}"
             );
 
             if start_key.is_empty() {
-                sqlx::query(&sql)
-                    .bind(prefix)
-                    .bind(include_deleted_val)
-                    .fetch_all(&self.pool)
-                    .await
+                let mut q = sqlx::query(&sql).bind(prefix).bind(include_deleted_val);
+                if filter_init_dir {
+                    q = q.bind(INIT_DIR_MARKER);
+                }
+                q.fetch_all(&self.pool).await
             } else {
-                sqlx::query(&sql)
-                    .bind(prefix)
-                    .bind(start_key)
-                    .bind(include_deleted_val)
-                    .fetch_all(&self.pool)
-                    .await
+                let mut q = sqlx::query(&sql).bind(prefix).bind(start_key).bind(include_deleted_val);
+                if filter_init_dir {
+                    q = q.bind(INIT_DIR_MARKER);
+                }
+                q.fetch_all(&self.pool).await
             }
         } else {
             // Historical query: must scan revisions up to the requested revision
@@ -425,6 +454,12 @@ impl SqliteBackend {
                 String::new()
             } else {
                 "AND mkv.name >= ?".to_string()
+            };
+
+            let init_dir_filter_hist = if filter_init_dir {
+                "AND (kv.value IS NULL OR kv.value != ?)"
+            } else {
+                ""
             };
 
             let sql = format!(
@@ -447,25 +482,27 @@ impl SqliteBackend {
                     GROUP BY mkv.name
                 ) AS maxkv ON maxkv.id = kv.id
                 WHERE (kv.deleted = 0 OR ?)
+                {init_dir_filter_hist}
                 ORDER BY kv.name ASC
                 {limit_clause}"
             );
 
             if start_key.is_empty() {
-                sqlx::query(&sql)
-                    .bind(prefix)
-                    .bind(revision)
-                    .bind(include_deleted_val)
-                    .fetch_all(&self.pool)
-                    .await
+                let mut q = sqlx::query(&sql).bind(prefix).bind(revision).bind(include_deleted_val);
+                if filter_init_dir {
+                    q = q.bind(INIT_DIR_MARKER);
+                }
+                q.fetch_all(&self.pool).await
             } else {
-                sqlx::query(&sql)
+                let mut q = sqlx::query(&sql)
                     .bind(prefix)
                     .bind(start_key)
                     .bind(revision)
-                    .bind(include_deleted_val)
-                    .fetch_all(&self.pool)
-                    .await
+                    .bind(include_deleted_val);
+                if filter_init_dir {
+                    q = q.bind(INIT_DIR_MARKER);
+                }
+                q.fetch_all(&self.pool).await
             }
         }
         .map_err(|e| BackendError::Internal(e.to_string()))?;
@@ -473,8 +510,9 @@ impl SqliteBackend {
         let mut events = Vec::with_capacity(rows.len());
 
         for row in &rows {
-            let event = self.row_to_event(row, keys_only, false)?;
-            events.push(event);
+            if let Some(event) = self.row_to_event(row, keys_only, false)? {
+                events.push(event);
+            }
         }
 
         Ok((current_rev, events))
@@ -517,7 +555,10 @@ impl SqliteBackend {
 
         for row in &rows {
             let event = self.row_to_event_poll(row)?;
-            events.push(event);
+            // Filter out etcd v2 init_dir placeholder records.
+            if !event.kv.value.is_empty() && event.kv.value != INIT_DIR_MARKER {
+                events.push(event);
+            }
         }
 
         Ok(events)
@@ -580,12 +621,13 @@ impl SqliteBackend {
     }
 
     /// Convert a database row to an Event.
+    /// Returns None for etcd v2 init_dir placeholder records (not real data).
     fn row_to_event(
         &self,
         row: &sqlx::sqlite::SqliteRow,
         keys_only: bool,
         with_old_value: bool,
-    ) -> Result<Event> {
+    ) -> Result<Option<Event>> {
         let mod_revision: i64 = row.get(0);
         let name: String = row.get(1);
         let created: i32 = row.get(2);
@@ -600,6 +642,12 @@ impl SqliteBackend {
             row.try_get::<Vec<u8>, _>(7).unwrap_or_default()
         };
 
+        // Filter out etcd v2 init_dir placeholder records.
+        // These are directory markers, not real data.
+        if !keys_only && value == INIT_DIR_MARKER {
+            return Ok(None);
+        }
+
         let old_value: Vec<u8> = if !keys_only && with_old_value {
             row.try_get::<Vec<u8>, _>(8).unwrap_or_default()
         } else {
@@ -609,10 +657,17 @@ impl SqliteBackend {
         let is_create = created != 0;
         let is_delete = deleted != 0;
 
+        // Ensure create_revision is non-zero so protobuf 3 serializes it.
+        // protobuf 3 omits fields with default value (0 for integers), which
+        // causes APISIX to receive nil for create_revision and fail sorting.
         let actual_create_rev = if is_create {
             mod_revision
-        } else {
+        } else if create_revision != 0 {
             create_revision
+        } else {
+            // Existing rows created before the fix have create_revision=0.
+            // Fall back to mod_revision so the field is always serialized.
+            mod_revision
         };
 
         let kv = KeyValue {
@@ -637,12 +692,12 @@ impl SqliteBackend {
             })
         };
 
-        Ok(Event {
+        Ok(Some(Event {
             create: is_create,
             delete: is_delete,
             kv,
             prev_kv,
-        })
+        }))
     }
 
     /// Return the cached current revision, fetching from DB if not yet cached.
@@ -741,7 +796,19 @@ impl SqliteBackend {
                 continue;
             }
 
-            trace!("poll: {} events after rev {}", events.len(), poll_revision);
+            // Log event details for debugging watch issues.
+            let event_summary: Vec<String> = events
+                .iter()
+                .map(|e| {
+                    format!(
+                        "{}(key={},rev={})",
+                        if e.delete { "DEL" } else { "PUT" },
+                        e.kv.key,
+                        e.kv.mod_revision
+                    )
+                })
+                .collect();
+            tracing::info!("POLL: {} events after rev {}: {}", events.len(), poll_revision, event_summary.join(", "));
 
             let mut rev = poll_revision;
             let mut sequential = Vec::new();
@@ -1067,11 +1134,15 @@ impl Backend for SqliteBackend {
     }
 
     async fn create(&self, key: &str, value: &[u8], lease: i64) -> Result<i64> {
-        // Check if key exists (including deleted — so we can get prev_revision)
+        // Check if key exists (including deleted — so we can get prev_revision).
+        // get_internal uses filter_init_dir=false so init_dir markers are visible.
         let (_rev, existing) = self.get_internal(key, 0, true, false).await?;
 
+        // Treat init_dir placeholders as non-existent so APISIX can re-create them
+        // without triggering a unique constraint violation on (name, prev_revision).
         if let Some(ref event) = existing
             && !event.delete
+            && event.kv.value != INIT_DIR_MARKER
         {
             return Err(BackendError::KeyExists);
         }
@@ -1083,8 +1154,21 @@ impl Backend for SqliteBackend {
             .map(|e| e.kv.value.as_slice())
             .unwrap_or(b"");
 
-        self.insert(key, true, false, 0, prev_revision, lease, value, old_value)
+        // Insert with create_revision=0; after insert we patch it to the row id
+        // so protobuf serialization includes a non-zero value.
+        let new_rev = self.insert(key, true, false, 0, prev_revision, lease, value, old_value)
+            .await?;
+
+        // Patch create_revision to the new row id so it's non-zero and gets
+        // serialized by protobuf (protobuf 3 omits default value 0).
+        sqlx::query("UPDATE kine SET create_revision = ? WHERE id = ?")
+            .bind(new_rev)
+            .bind(new_rev)
+            .execute(&self.pool)
             .await
+            .map_err(|e| BackendError::Internal(format!("create_revision patch failed: {e}")))?;
+
+        Ok(new_rev)
     }
 
     async fn delete(&self, key: &str, revision: i64) -> Result<(i64, Option<KeyValue>, bool)> {
@@ -1207,6 +1291,7 @@ impl Backend for SqliteBackend {
                 revision,
                 false,
                 keys_only,
+                true,
             )
             .await?;
 
@@ -1238,24 +1323,30 @@ impl Backend for SqliteBackend {
                 "AND cur.name >= ?".to_string()
             };
 
+            // Filter out etcd v2 init_dir placeholder records
+            const INIT_DIR_FILTER: &str = "AND (kv.value IS NULL OR kv.value != ?)";
+
             let sql = format!(
                 "SELECT COUNT(*)
                 FROM kine AS kv
                 JOIN kine_current AS cur ON cur.id = kv.id
                 WHERE cur.name LIKE ? ESCAPE '^'
                 {start_where}
-                AND kv.deleted = 0"
+                AND kv.deleted = 0
+                {INIT_DIR_FILTER}"
             );
 
             let row = if effective_start.is_empty() {
                 sqlx::query_as::<_, (i64,)>(&sql)
                     .bind(&like_prefix)
+                    .bind(INIT_DIR_MARKER)
                     .fetch_one(&self.pool)
                     .await
             } else {
                 sqlx::query_as::<_, (i64,)>(&sql)
                     .bind(&like_prefix)
                     .bind(effective_start)
+                    .bind(INIT_DIR_MARKER)
                     .fetch_one(&self.pool)
                     .await
             }
@@ -1269,6 +1360,8 @@ impl Backend for SqliteBackend {
             } else {
                 "AND mkv.name >= ?".to_string()
             };
+
+            const INIT_DIR_FILTER_HIST: &str = "AND (kv.value IS NULL OR kv.value != ?)";
 
             let sql = format!(
                 "SELECT COUNT(c.theid)
@@ -1284,6 +1377,7 @@ impl Backend for SqliteBackend {
                         GROUP BY mkv.name
                     ) AS maxkv ON maxkv.id = kv.id
                     WHERE kv.deleted = 0
+                    {INIT_DIR_FILTER_HIST}
                 ) c"
             );
 
@@ -1291,6 +1385,7 @@ impl Backend for SqliteBackend {
                 sqlx::query_as::<_, (i64,)>(&sql)
                     .bind(&like_prefix)
                     .bind(revision)
+                    .bind(INIT_DIR_MARKER)
                     .fetch_one(&self.pool)
                     .await
             } else {
@@ -1298,6 +1393,7 @@ impl Backend for SqliteBackend {
                     .bind(&like_prefix)
                     .bind(effective_start)
                     .bind(revision)
+                    .bind(INIT_DIR_MARKER)
                     .fetch_one(&self.pool)
                     .await
             }

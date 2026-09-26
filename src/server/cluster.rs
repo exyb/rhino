@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use tonic::{Request, Response, Status};
 
 use crate::backend::Backend;
@@ -6,27 +7,49 @@ use crate::proto::etcdserverpb::*;
 
 use super::KvBridge;
 
-/// Extract the authority URL from gRPC metadata, matching kine's authorityURL
-/// (cluster.go:48-64). Handles etcd v3.5's encoded address list format.
-fn authority_url(request: &Request<MemberListRequest>) -> String {
-    let scheme = "http";
-    let authority = request
-        .metadata()
-        .get(":authority")
-        .and_then(|v| v.to_str().ok());
+/// Virtual interface prefixes to exclude when looking for a physical IP.
+const VIRTUAL_IFACE_PREFIXES: &[&str] = &[
+    "tap", "veth", "br-", "docker", "virbr", "vnet", "tun", "wg", "dummy", "bond",
+];
 
-    let Some(authority) = authority else {
-        return format!("{scheme}://127.0.0.1:2379");
-    };
-
-    // etcd v3.5 encodes the endpoint address list as "#initially=[ADDRESS1;ADDRESS2]"
-    if let Some(inner) = authority.strip_prefix("#initially=[") {
-        let inner = inner.strip_suffix(']').unwrap_or(inner);
-        return inner.replace(';', ",");
+/// Get a suitable local IP address for client connections.
+///
+/// If the listen address is not 0.0.0.0, returns that address.
+/// Otherwise, finds the first physical (non-virtual) interface with an IPv4 address.
+pub fn get_client_bind_address(listen_addr: &std::net::SocketAddr) -> Option<String> {
+    // If listening on a specific address, use that
+    if !listen_addr.ip().is_unspecified() {
+        return Some(format!("{}:{}", listen_addr.ip(), listen_addr.port()));
     }
 
-    format!("{scheme}://{authority}")
+    // Listening on 0.0.0.0 - find a physical interface
+    let interfaces = local_ip_address::list_afinet_netifas()
+        .ok()
+        .unwrap_or_default();
+
+    for (name, ip) in interfaces {
+        let name = name.to_lowercase();
+
+        // Skip virtual interfaces
+        if VIRTUAL_IFACE_PREFIXES.iter().any(|p| name.starts_with(p)) {
+            continue;
+        }
+
+        // Skip loopback
+        if ip.is_loopback() {
+            continue;
+        }
+
+        // Prefer IPv4
+        if let IpAddr::V4(ipv4) = ip {
+            return Some(format!("{}:{}", ipv4, listen_addr.port()));
+        }
+    }
+
+    // Fallback: try to get local IP
+    local_ip_address::local_ip().ok().map(|ip| format!("{}:{}", ip, listen_addr.port()))
 }
+
 
 #[tonic::async_trait]
 impl<B: Backend> Cluster for KvBridge<B> {
@@ -53,16 +76,22 @@ impl<B: Backend> Cluster for KvBridge<B> {
 
     async fn member_list(
         &self,
-        request: Request<MemberListRequest>,
+        _request: Request<MemberListRequest>,
     ) -> Result<Response<MemberListResponse>, Status> {
-        let listen_url = authority_url(&request);
+        // Get the client bind address from the configured listen address.
+        // If listening on 0.0.0.0, find a physical interface IP.
+        let client_urls = if let Some(bind_ip) = &self.client_bind_address {
+            vec![format!("http://{}", bind_ip)]
+        } else {
+            vec![]
+        };
 
         Ok(Response::new(MemberListResponse {
             header: Some(ResponseHeader::default()),
             members: vec![Member {
                 name: "kine".to_string(),
-                peer_ur_ls: vec![listen_url.clone()],
-                client_ur_ls: vec![listen_url],
+                peer_ur_ls: client_urls.clone(),
+                client_ur_ls: client_urls,
                 is_learner: false,
                 ..Default::default()
             }],

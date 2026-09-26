@@ -245,14 +245,63 @@ fn extract_trailing_ranges(success: &[RequestOp]) -> Vec<RangeRequest> {
 }
 
 impl<B: Backend> KvBridge<B> {
+    /// Detect the single-key lookup pattern used by lua-resty-etcd's readdir:
+    /// range_end is key with its last byte incremented by 1.
+    ///
+    /// To distinguish from a prefix query (which uses the same range_end pattern),
+    /// we also require that the byte before the last byte of key is '/'.
+    /// This works because APISIX builds single-key paths as "/<resource>/<id>",
+    /// while prefix paths are just "/<resource>".
+    ///
+    /// Examples:
+    ///   Single key: key="/apisix/routes/1" -> range_end="/apisix/routes/2"  (matched)
+    ///   Prefix:     key="/apisix/routes"  -> range_end="/apisix/routet"  (not matched)
+    fn is_single_key_lookup(key: &[u8], range_end: &[u8]) -> bool {
+        if key.len() != range_end.len() || key.len() < 2 {
+            return false;
+        }
+        // The byte before the last must be '/' to distinguish from prefix queries
+        if key[key.len() - 2] != b'/' {
+            return false;
+        }
+        // All bytes except the last must be equal
+        if key[..key.len() - 1] != range_end[..range_end.len() - 1] {
+            return false;
+        }
+        // The last byte of range_end must be last byte of key + 1
+        let last_key = key[key.len() - 1];
+        let last_range = range_end[range_end.len() - 1];
+        last_range == last_key.wrapping_add(1)
+    }
+
     async fn handle_range(&self, r: &RangeRequest) -> Result<RangeResponse, Status> {
-        if r.range_end.is_empty() {
+        let key_str = String::from_utf8_lossy(&r.key);
+        let range_end_empty = r.range_end.is_empty();
+        let is_single = range_end_empty && !key_str.ends_with('/')
+            || !range_end_empty && Self::is_single_key_lookup(&r.key, &r.range_end);
+        tracing::info!("handle_range: key={:?}, range_end={:?}, is_single={}",
+            key_str, String::from_utf8_lossy(&r.range_end), is_single);
+
+        // Distinguish single key lookup vs prefix query:
+        // - If range_end is empty AND key does NOT end with '/', it's a single key lookup
+        //   e.g. key="/apisix/routes/1" -> handle_get
+        // - If range_end is key with last byte + 1 (lua-resty-etcd readdir pattern),
+        //   it's also a single key lookup
+        //   e.g. key="/apisix/routes/1", range_end="/apisix/routes/2" -> handle_get
+        // - If range_end is empty AND key ends with '/', it's a prefix query
+        //   e.g. key="/apisix/routes/" -> handle_list
+        // - Otherwise, it's a range/prefix query
+        if is_single {
+            tracing::info!("handle_range: routing to handle_get (single key)");
             self.handle_get(r).await
         } else {
+            tracing::info!("handle_range: routing to handle_list (prefix/range query)");
             self.handle_list(r).await
         }
     }
 
+    /// Get a single key (not used by APISIX REST gateway, but kept for completeness).
+    #[allow(dead_code)]
     async fn handle_get(&self, r: &RangeRequest) -> Result<RangeResponse, Status> {
         let raw_key = String::from_utf8_lossy(&r.key);
         let key = redirect_key(&raw_key);
@@ -290,7 +339,20 @@ impl<B: Backend> KvBridge<B> {
 
     async fn handle_list(&self, r: &RangeRequest) -> Result<RangeResponse, Status> {
         let range_end = &r.range_end;
-        let prefix = {
+        let key_str = String::from_utf8_lossy(&r.key);
+
+        // Calculate the prefix for the range query.
+        // When range_end is empty (APISIX style), use the key as the prefix.
+        // When range_end is provided (standard etcd v3), calculate prefix from range_end.
+        let prefix = if range_end.is_empty() {
+            // APISIX sends empty range_end for prefix queries.
+            // Use the key as the prefix (append '/' if not already present).
+            let mut s = key_str.to_string();
+            if !s.ends_with('/') {
+                s.push('/');
+            }
+            s
+        } else {
             let mut p = range_end.clone();
             if let Some(last) = p.last_mut() {
                 *last = last.wrapping_sub(1);
@@ -301,7 +363,8 @@ impl<B: Backend> KvBridge<B> {
             }
             s
         };
-        let start = String::from_utf8_lossy(&r.key).to_string();
+        let start = key_str.to_string();
+        tracing::info!("handle_list: key={:?}, range_end={:?}, prefix={:?}, start={}", r.key, range_end, prefix, start);
         let revision = if r.revision > 0 { r.revision } else { 0 };
 
         if r.count_only {
@@ -320,14 +383,49 @@ impl<B: Backend> KvBridge<B> {
         }
 
         let limit = if r.limit > 0 { r.limit + 1 } else { 0 };
-        let (rev, kvs) = self
+        let (rev, mut kvs) = self
             .backend
             .list(&prefix, &start, limit, revision, r.keys_only)
             .await
             .map_err(backend_err_to_status)?;
 
+        // APISIX's lua-resty-etcd expects `kvs[1]` to exist for directory
+        // listings — an empty `kvs` array crashes with "attempt to index
+        // local 'kvs' (a nil value)". For known APISIX resource directories,
+        // inject the init_dir placeholder when the filtered list is empty so
+        // APISIX sees an empty directory node (count still excludes it).
+        const INIT_DIR_PREFIXES: &[&str] = &[
+            "/apisix/services/",
+            "/apisix/routes/",
+            "/apisix/upstreams/",
+            "/apisix/consumer_groups/",
+            "/apisix/plugin_configs/",
+            "/apisix/secrets/",
+            "/apisix/protos/",
+            "/apisix/global_rules/",
+            "/apisix/ssls/",
+            "/apisix/consumers/",
+        ];
+        let needs_init_dir = INIT_DIR_PREFIXES.iter().any(|p| prefix.starts_with(p));
+        if kvs.is_empty() && needs_init_dir {
+            // init_dir marker 的 key 就是 prefix 本身（带尾部 /），如 /apisix/services/
+            if let Ok((_, Some(init_kv))) = self.backend.get(&prefix, "", 1, 0, false).await {
+                if init_kv.value == b"init_dir" {
+                    tracing::info!("handle_list: injecting init_dir for empty dir {}", prefix);
+                    kvs.push(init_kv);
+                }
+            }
+        }
+
         let proto_kvs: Vec<mvccpb::KeyValue> = kvs.iter().map(to_proto_kv).collect();
         let count = proto_kvs.len() as i64;
+
+        // count excludes the init_dir placeholder (real entries only)
+        let real_count = if kvs.len() == 1 && kvs[0].value == b"init_dir" {
+            0
+        } else {
+            count
+        };
 
         let (kvs, more, count) = if r.limit > 0 && count > r.limit {
             let trimmed = proto_kvs[..r.limit as usize].to_vec();
@@ -339,7 +437,7 @@ impl<B: Backend> KvBridge<B> {
                 .map_err(backend_err_to_status)?;
             (trimmed, true, total_count)
         } else {
-            (proto_kvs, false, count)
+            (proto_kvs, false, real_count)
         };
 
         Ok(RangeResponse {

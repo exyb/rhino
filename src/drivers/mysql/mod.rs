@@ -23,6 +23,11 @@ const COMPACT_BATCH_SIZE: i64 = 1000;
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const COMPACT_INTERVAL: Duration = Duration::from_secs(300);
 
+/// etcd v2 init_dir placeholder value. APISIX uses directory markers
+/// (key="/apisix/routes/", value="init_dir") to distinguish directories.
+/// These are not real data and must be excluded from query results.
+const INIT_DIR_MARKER: &[u8] = b"init_dir";
+
 /// Configuration for the MySQL backend.
 #[derive(Debug, Clone)]
 pub struct MysqlConfig {
@@ -108,7 +113,10 @@ impl MysqlBackend {
         .await
         .map_err(|e| BackendError::Internal(format!("schema setup failed: {e}")))?;
 
-        // Create indexes — ignore error 1061 (duplicate key name) for idempotency
+        // Create indexes idempotently. MySQL < 8.0 lacks DROP INDEX IF EXISTS,
+        // so we attempt CREATE INDEX and ignore error 1061 (duplicate key name).
+        // The error detection checks both the SQL error code and the message
+        // text as fallback, since some MySQL/MariaDB versions return code=None.
         let indexes = [
             "CREATE INDEX kine_name_index ON kine (name)",
             "CREATE INDEX kine_name_id_index ON kine (name, id)",
@@ -209,20 +217,24 @@ impl MysqlBackend {
     }
 
     async fn db_current_revision(&self) -> Result<i64> {
-        let row: (Option<i64>,) = sqlx::query_as("SELECT MAX(id) FROM kine")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| BackendError::Internal(e.to_string()))?;
+        // CAST to SIGNED: id is BIGINT UNSIGNED, sqlx can't decode it as i64 directly.
+        let row: (Option<i64>,) =
+            sqlx::query_as("SELECT CAST(MAX(id) AS SIGNED) FROM kine")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| BackendError::Internal(e.to_string()))?;
         Ok(row.0.unwrap_or(0))
     }
 
     async fn get_compact_revision(&self) -> Result<i64> {
-        let row: (Option<i64>,) =
-            sqlx::query_as("SELECT MAX(prev_revision) FROM kine WHERE name = ?")
-                .bind(COMPACT_REV_KEY)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| BackendError::Internal(e.to_string()))?;
+        // CAST to SIGNED: prev_revision is BIGINT UNSIGNED.
+        let row: (Option<i64>,) = sqlx::query_as(
+            "SELECT CAST(MAX(prev_revision) AS SIGNED) FROM kine WHERE name = ?",
+        )
+        .bind(COMPACT_REV_KEY)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| BackendError::Internal(e.to_string()))?;
         Ok(row.0.unwrap_or(0))
     }
 
@@ -235,12 +247,15 @@ impl MysqlBackend {
     ) -> Result<(i64, Option<Event>)> {
         let escaped = key.replace('_', "^_");
         let (rev, events) = self
-            .list_internal(&escaped, "", 1, revision, include_deleted, keys_only)
+            .list_internal(&escaped, "", 1, revision, include_deleted, keys_only, false)
             .await?;
         Ok((rev, events.into_iter().next()))
     }
 
     /// Core list query using JOIN (SELECT MAX(id) ... GROUP BY name) — same pattern as SQLite/kine generic.
+    ///
+    /// `filter_init_dir`: when true, excludes etcd v2 init_dir placeholder records.
+    /// List/count queries pass true; get_internal (used by create/delete/update) passes false.
     async fn list_internal(
         &self,
         prefix: &str,
@@ -249,6 +264,7 @@ impl MysqlBackend {
         revision: i64,
         include_deleted: bool,
         keys_only: bool,
+        filter_init_dir: bool,
     ) -> Result<(i64, Vec<Event>)> {
         let value_cols = if keys_only {
             ""
@@ -277,16 +293,24 @@ impl MysqlBackend {
             String::new()
         };
 
+        // Filter out etcd v2 init_dir placeholder records at the SQL level.
+        // These are directory markers (value = 'init_dir'), not real data.
+        let init_dir_filter = if filter_init_dir {
+            "AND (kv.value IS NULL OR kv.value != ?)"
+        } else {
+            ""
+        };
+
         let sql = format!(
             "SELECT
-                (SELECT MAX(rkv.id) FROM kine AS rkv),
-                (SELECT MAX(crkv.prev_revision) FROM kine AS crkv WHERE crkv.name = '{COMPACT_REV_KEY}'),
-                kv.id AS theid,
+                (SELECT CAST(MAX(rkv.id) AS SIGNED) FROM kine AS rkv),
+                (SELECT CAST(MAX(crkv.prev_revision) AS SIGNED) FROM kine AS crkv WHERE crkv.name = '{COMPACT_REV_KEY}'),
+                CAST(kv.id AS SIGNED) AS theid,
                 kv.name AS thename,
                 kv.created,
                 kv.deleted,
-                kv.create_revision,
-                kv.prev_revision,
+                CAST(kv.create_revision AS SIGNED),
+                CAST(kv.prev_revision AS SIGNED),
                 kv.lease
                 {value_cols}
             FROM kine AS kv
@@ -298,6 +322,7 @@ impl MysqlBackend {
                 GROUP BY mkv.name
             ) AS maxkv ON maxkv.id = kv.id
             WHERE (kv.deleted = 0 OR ?)
+            {init_dir_filter}
             ORDER BY kv.name ASC
             {limit_clause}"
         );
@@ -305,18 +330,20 @@ impl MysqlBackend {
         let include_deleted_val: i32 = if include_deleted { 1 } else { 0 };
 
         let rows = if let Some(ref sk) = query {
-            sqlx::query(&sql)
+            let mut q = sqlx::query(&sql)
                 .bind(prefix)
                 .bind(sk)
-                .bind(include_deleted_val)
-                .fetch_all(&self.pool)
-                .await
+                .bind(include_deleted_val);
+            if filter_init_dir {
+                q = q.bind(INIT_DIR_MARKER);
+            }
+            q.fetch_all(&self.pool).await
         } else {
-            sqlx::query(&sql)
-                .bind(prefix)
-                .bind(include_deleted_val)
-                .fetch_all(&self.pool)
-                .await
+            let mut q = sqlx::query(&sql).bind(prefix).bind(include_deleted_val);
+            if filter_init_dir {
+                q = q.bind(INIT_DIR_MARKER);
+            }
+            q.fetch_all(&self.pool).await
         }
         .map_err(|e| BackendError::Internal(e.to_string()))?;
 
@@ -362,19 +389,20 @@ impl MysqlBackend {
 
         let sql = format!(
             "SELECT
-                (SELECT MAX(rkv.id) FROM kine AS rkv),
-                (SELECT MAX(crkv.prev_revision) FROM kine AS crkv WHERE crkv.name = '{COMPACT_REV_KEY}'),
-                kv.id AS theid,
+                (SELECT CAST(MAX(rkv.id) AS SIGNED) FROM kine AS rkv),
+                (SELECT CAST(MAX(crkv.prev_revision) AS SIGNED) FROM kine AS crkv WHERE crkv.name = '{COMPACT_REV_KEY}'),
+                CAST(kv.id AS SIGNED) AS theid,
                 kv.name AS thename,
                 kv.created,
                 kv.deleted,
-                kv.create_revision,
-                kv.prev_revision,
+                CAST(kv.create_revision AS SIGNED),
+                CAST(kv.prev_revision AS SIGNED),
                 kv.lease,
                 kv.value,
                 kv.old_value
             FROM kine AS kv
             WHERE kv.name LIKE ? ESCAPE '^' AND kv.id > ?
+            AND (kv.value IS NULL OR kv.value != ?)
             ORDER BY kv.id ASC
             {limit_clause}"
         );
@@ -382,6 +410,7 @@ impl MysqlBackend {
         let rows = sqlx::query(&sql)
             .bind(prefix)
             .bind(revision)
+            .bind(INIT_DIR_MARKER)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| BackendError::Internal(e.to_string()))?;
@@ -665,9 +694,18 @@ fn is_unique_violation(err: &sqlx::Error) -> bool {
 }
 
 /// Check if a sqlx error is a MySQL duplicate key name error (error 1061).
+///
+/// Checks both the SQL error code and the message text as fallback, since
+/// some MySQL/MariaDB versions and sqlx drivers return `code()` as `None`
+/// while still carrying the "Duplicate key name" message.
 fn is_duplicate_key_name(err: &sqlx::Error) -> bool {
     if let sqlx::Error::Database(db_err) = err {
-        db_err.code().is_some_and(|code| code == "1061")
+        if db_err.code().is_some_and(|code| code == "1061") {
+            return true;
+        }
+        // Fallback: check the message text.
+        let msg = db_err.message();
+        msg.contains("Duplicate key name") || msg.contains("1061")
     } else {
         false
     }
@@ -735,10 +773,14 @@ impl Backend for MysqlBackend {
     }
 
     async fn create(&self, key: &str, value: &[u8], lease: i64) -> Result<i64> {
+        // get_internal uses filter_init_dir=false so init_dir markers are visible.
         let (_rev, existing) = self.get_internal(key, 0, true, false).await?;
 
+        // Treat init_dir placeholders as non-existent so APISIX can re-create them
+        // without triggering a unique constraint violation on (name, prev_revision).
         if let Some(ref event) = existing
             && !event.delete
+            && event.kv.value != INIT_DIR_MARKER
         {
             return Err(BackendError::KeyExists);
         }
@@ -847,6 +889,7 @@ impl Backend for MysqlBackend {
                 revision,
                 false,
                 keys_only,
+                true,
             )
             .await?;
 
@@ -864,7 +907,7 @@ impl Backend for MysqlBackend {
         let translated_start = translate_start_key(start_key);
 
         let (rev, events) = self
-            .list_internal(&like_prefix, &translated_start, 0, revision, false, true)
+            .list_internal(&like_prefix, &translated_start, 0, revision, false, true, true)
             .await?;
 
         Ok((rev, events.len() as i64))
@@ -945,24 +988,26 @@ impl Backend for MysqlBackend {
 
                 let sql =
                     "SELECT
-                        (SELECT MAX(rkv.id) FROM kine AS rkv),
-                        (SELECT MAX(crkv.prev_revision) FROM kine AS crkv WHERE crkv.name = 'compact_rev_key'),
-                        kv.id AS theid,
+                        (SELECT CAST(MAX(rkv.id) AS SIGNED) FROM kine AS rkv),
+                        (SELECT CAST(MAX(crkv.prev_revision) AS SIGNED) FROM kine AS crkv WHERE crkv.name = 'compact_rev_key'),
+                        CAST(kv.id AS SIGNED) AS theid,
                         kv.name AS thename,
                         kv.created,
                         kv.deleted,
-                        kv.create_revision,
-                        kv.prev_revision,
+                        CAST(kv.create_revision AS SIGNED),
+                        CAST(kv.prev_revision AS SIGNED),
                         kv.lease,
                         kv.value,
                         kv.old_value
                     FROM kine AS kv
                     WHERE kv.name LIKE ? ESCAPE '^' AND kv.id > ?
+                    AND (kv.value IS NULL OR kv.value != ?)
                     ORDER BY kv.id ASC";
 
                 if let Ok(rows) = sqlx::query(sql)
                     .bind(&after_prefix)
                     .bind(start_rev)
+                    .bind(INIT_DIR_MARKER)
                     .fetch_all(&pool)
                     .await
                 {

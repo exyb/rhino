@@ -12,15 +12,27 @@ path = "src/bin/server.rs"
 [dependencies]
 async-stream = "0.3"
 async-trait = "0.1"
+base64 = "0.22"
+bytes = "1"
 clap = { version = "4", features = ["derive"] }
 futures-core = "0.3"
+futures = "0.3"
+http = "1"
+http-body = "1"
+hyper = { version = "1", features = ["full"] }
+local-ip-address = "0.6"
+hyper-util = { version = "0.1", features = ["tokio"] }
 prost = "0.13"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "postgres", "mysql"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tonic = "0.12"
 tonic-health = "0.12"
+tonic-web = "0.12"
+tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"

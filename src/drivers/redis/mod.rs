@@ -37,6 +37,11 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const COMPACT_INTERVAL: Duration = Duration::from_secs(300);
 const COMPACT_MIN_RETAIN: i64 = 1000;
 
+/// etcd v2 init_dir placeholder value. APISIX uses directory markers
+/// (key="/apisix/routes/", value="init_dir") to distinguish directories.
+/// These are not real data and must be excluded from query results.
+const INIT_DIR_MARKER: &[u8] = b"init_dir";
+
 // Redis key names. The `{rhino}` hash tag ensures all keys land on the same
 // hash slot, which is required for Lua scripts to access them in Redis Cluster.
 const REV_KEY: &str = "{rhino}:rev";
@@ -156,11 +161,18 @@ impl Scripts {
             local row_deleted = redis.call("HGET", row_key, "deleted")
 
             if row_deleted == "0" or row_deleted == false then
-                -- Key exists and is alive — cannot create
-                return redis.error_reply("KEY_EXISTS")
+                -- Key exists and is alive — check if it's an init_dir placeholder.
+                -- APISIX uses init_dir markers (value = "init_dir") as directory
+                -- placeholders. These should be treated as non-existent so
+                -- APISIX can re-create them without a unique constraint violation.
+                local row_value = redis.call("HGET", row_key, "value") or ""
+                if row_value ~= "init_dir" then
+                    return redis.error_reply("KEY_EXISTS")
+                end
+                -- init_dir marker — treat as non-existent, allow re-create
             end
 
-            -- Key was deleted — re-create is allowed
+            -- Key was deleted (or is init_dir marker) — re-create is allowed
             prev_revision = tostring(current_rev)
             old_value = redis.call("HGET", row_key, "value") or ""
         end
@@ -792,6 +804,9 @@ impl RedisBackend {
     }
 
     /// Core list query for prefix scans. Returns (current_revision, events).
+    ///
+    /// `filter_init_dir`: when true, excludes etcd v2 init_dir placeholder records.
+    /// List/count queries pass true; get_internal (used by create/delete/update) passes false.
     async fn list_internal(
         &self,
         prefix: &str,
@@ -800,6 +815,7 @@ impl RedisBackend {
         revision: i64,
         include_deleted: bool,
         keys_only: bool,
+        filter_init_dir: bool,
     ) -> Result<(i64, Vec<Event>)> {
         let current_rev = self.cached_revision().await?;
         let compact_rev = self.get_compact_revision().await?;
@@ -883,6 +899,12 @@ impl RedisBackend {
             if !include_deleted && row.deleted != 0 {
                 continue;
             }
+            // Filter out etcd v2 init_dir placeholder records (when requested).
+            // row.value is always populated from HGETALL (keys_only only
+            // affects what row_to_event returns, not what is fetched).
+            if filter_init_dir && row.value == INIT_DIR_MARKER {
+                continue;
+            }
             events.push(Self::row_to_event(&row, keys_only, false));
 
             if limit > 0 && events.len() as i64 >= limit {
@@ -912,6 +934,10 @@ impl RedisBackend {
 
         let mut events = Vec::with_capacity(rev_ids.len());
         for row in rows.into_iter().flatten() {
+            // Filter out etcd v2 init_dir placeholder records.
+            if row.value == INIT_DIR_MARKER {
+                continue;
+            }
             events.push(Self::row_to_event(&row, false, true));
         }
 
@@ -1618,7 +1644,7 @@ impl Backend for RedisBackend {
         let effective_start = if start_key == prefix { "" } else { start_key };
 
         let (rev, events) = self
-            .list_internal(prefix, effective_start, limit, revision, false, keys_only)
+            .list_internal(prefix, effective_start, limit, revision, false, keys_only, true)
             .await?;
 
         let kvs = events.into_iter().map(|e| e.kv).collect();
@@ -1635,7 +1661,7 @@ impl Backend for RedisBackend {
         let effective_start = if start_key == prefix { "" } else { start_key };
 
         let (rev, events) = self
-            .list_internal(prefix, effective_start, 0, revision, false, true)
+            .list_internal(prefix, effective_start, 0, revision, false, true, true)
             .await?;
 
         Ok((rev, events.len() as i64))

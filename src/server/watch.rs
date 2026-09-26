@@ -17,13 +17,14 @@ use crate::proto::mvccpb;
 use super::KvBridge;
 
 /// Global watch ID counter — matches kine's globally unique watch IDs.
-static WATCH_ID_COUNTER: AtomicI64 = AtomicI64::new(1);
+pub(crate) static WATCH_ID_COUNTER: AtomicI64 = AtomicI64::new(1);
 
 /// How often to check if a broadcast progress response should be sent.
 /// Matches kine's `progressResponsePeriod` (watch.go:19).
 const PROGRESS_ALL_INTERVAL: Duration = Duration::from_millis(100);
 
-type WatchResponseStream = Pin<Box<dyn Stream<Item = Result<WatchResponse, Status>> + Send>>;
+pub(crate) type WatchResponseStream =
+    Pin<Box<dyn Stream<Item = Result<WatchResponse, Status>> + Send>>;
 
 fn backend_err_to_status(e: BackendError) -> Status {
     match e {
@@ -33,16 +34,16 @@ fn backend_err_to_status(e: BackendError) -> Status {
 }
 
 /// Shared mutable state for a Watch stream, holding per-watch cancel and progress handles.
-struct WatcherState {
-    cancels: HashMap<i64, tokio::sync::oneshot::Sender<()>>,
+pub(crate) struct WatcherState {
+    pub(crate) cancels: HashMap<i64, tokio::sync::oneshot::Sender<()>>,
     /// Progress channels for watches created with `progress_notify=true`.
     /// Capacity-1 mpsc channels: `try_send` failing with Full means the watcher is not synced.
-    progress: HashMap<i64, mpsc::Sender<i64>>,
+    pub(crate) progress: HashMap<i64, mpsc::Sender<i64>>,
 }
 
 /// Background task: broadcast progress if all watchers are synced (every 100ms).
 /// Matches kine's `ProgressAll` (watch.go:344-378).
-async fn progress_all<B: Backend>(
+pub(crate) async fn progress_all<B: Backend>(
     backend: Arc<B>,
     resp_tx: mpsc::Sender<Result<WatchResponse, Status>>,
     notify: Arc<AtomicBool>,
@@ -111,7 +112,7 @@ async fn progress_all<B: Backend>(
 
 /// Background task: per-watcher progress if synced (every ~5s + jitter).
 /// Matches kine's `ProgressIfSynced` (watch.go:380-407).
-async fn progress_if_synced<B: Backend>(
+pub(crate) async fn progress_if_synced<B: Backend>(
     backend: Arc<B>,
     resp_tx: mpsc::Sender<Result<WatchResponse, Status>>,
     notify: Arc<AtomicBool>,
@@ -214,8 +215,18 @@ impl<B: Backend> Watch for KvBridge<B> {
 
                 match req.request_union {
                     Some(watch_request::RequestUnion::CreateRequest(create)) => {
+                        tracing::info!(
+                            "WATCH create_request: key={:?}, range_end={:?}, start_revision={}, progress_notify={}, watch_id={}",
+                            String::from_utf8_lossy(&create.key),
+                            String::from_utf8_lossy(&create.range_end),
+                            create.start_revision,
+                            create.progress_notify,
+                            create.watch_id,
+                        );
+
                         // Reject client-provided watch IDs (kine only accepts AutoWatchID = 0)
                         if create.watch_id != 0 {
+                            tracing::warn!("WATCH rejected: client-provided watch_id={}", create.watch_id);
                             let _ = resp_tx
                                 .send(Ok(WatchResponse {
                                     header: Some(ResponseHeader::default()),
@@ -232,6 +243,7 @@ impl<B: Backend> Watch for KvBridge<B> {
                         }
 
                         let watch_id = WATCH_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+                        tracing::info!("WATCH created: watch_id={}", watch_id);
                         let raw_key = String::from_utf8_lossy(&create.key).to_string();
                         // Redirect compact_rev_key to internal key
                         let key = if raw_key == "compact_rev_key" {
@@ -284,6 +296,7 @@ impl<B: Backend> Watch for KvBridge<B> {
                         let backend = backend.clone();
                         let resp_tx = resp_tx.clone();
                         tokio::spawn(async move {
+                            tracing::info!("WATCH task started: watch_id={}, key={}, start_revision={}", watch_id, key, start_revision);
                             let watch_result = match backend.watch(&key, start_revision).await {
                                 Ok(wr) => {
                                     // Only cancel if the requested start_revision falls
@@ -345,8 +358,10 @@ impl<B: Backend> Watch for KvBridge<B> {
                                 tokio::select! {
                                     event_batch = events_rx.recv() => {
                                         let Some(mut events) = event_batch else {
+                                            tracing::info!("WATCH event channel closed: watch_id={}", watch_id);
                                             break; // Channel closed
                                         };
+                                        tracing::debug!("WATCH received {} events: watch_id={}", events.len(), watch_id);
 
                                         // Coalesce queued batches (matching kine's event batching)
                                         while let Ok(more) = events_rx.try_recv() {
@@ -385,10 +400,23 @@ impl<B: Backend> Watch for KvBridge<B> {
 
                                         let last_rev = events
                                             .last()
-                                            .map(|e| e.kv.mod_revision)
+                                                                    .map(|e| e.kv.mod_revision)
                                             .unwrap_or(0);
 
                                         if last_rev >= start_revision || start_revision == 0 {
+                                            let event_types: Vec<&str> = proto_events
+                                                .iter()
+                                                .map(|e| match e.r#type {
+                                                    0 => "PUT",
+                                                    _ => "DELETE",
+                                                })
+                                                .collect();
+                                            tracing::info!(
+                                                "WATCH event sent: watch_id={}, revision={}, events={:?}",
+                                                watch_id,
+                                                last_rev,
+                                                event_types,
+                                            );
                                             if resp_tx.send(Ok(WatchResponse {
                                                 header: Some(ResponseHeader {
                                                     revision: last_rev,
@@ -398,6 +426,7 @@ impl<B: Backend> Watch for KvBridge<B> {
                                                 events: proto_events,
                                                 ..Default::default()
                                             })).await.is_err() {
+                                                tracing::warn!("WATCH client disconnected: watch_id={}", watch_id);
                                                 break; // Client disconnected
                                             }
                                         }
@@ -435,10 +464,14 @@ impl<B: Backend> Watch for KvBridge<B> {
                         });
                     }
                     Some(watch_request::RequestUnion::CancelRequest(cancel)) => {
+                        tracing::info!("WATCH cancel_request: watch_id={}", cancel.watch_id);
                         let mut s = state.lock().await;
                         // Signal the watch task to stop
                         if let Some(cancel_tx) = s.cancels.remove(&cancel.watch_id) {
                             let _ = cancel_tx.send(());
+                            tracing::info!("WATCH cancelled: watch_id={}", cancel.watch_id);
+                        } else {
+                            tracing::warn!("WATCH cancel failed: watch_id={} not found", cancel.watch_id);
                         }
                         // Clean up progress channel
                         s.progress.remove(&cancel.watch_id);
