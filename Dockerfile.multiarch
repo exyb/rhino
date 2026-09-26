@@ -1,0 +1,17 @@
+FROM debian:bookworm-slim
+ARG TARGETPLATFORM
+ARG TARGETARCH
+ARG BINARY_PATH=dist/${TARGETARCH}/rhino-server
+
+COPY sources.list /etc/apt/sources.list
+#RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+
+# Pick the right pre-built binary for the target arch.
+COPY ${BINARY_PATH}  /usr/local/bin/rhino-server
+
+RUN chmod +x /usr/local/bin/rhino-server && mkdir -p /data/db
+
+EXPOSE 2379
+
+ENTRYPOINT ["rhino-server"]
+CMD ["--listen-address", "0.0.0.0:2379", "--db-path", "/data/db/state.db"]

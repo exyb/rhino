@@ -3,6 +3,7 @@ FROM rust:1.84-bookworm AS builder
 WORKDIR /build
 
 # Install protobuf compiler (needed by tonic-build)
+COPY sources.list /etc/apt/sources.list
 RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
 
 # Cache dependency builds: copy manifests first, then build deps
@@ -18,7 +19,7 @@ COPY src/ src/
 RUN cargo build --release --bin rhino-server
 
 FROM debian:bookworm-slim
-
+COPY sources.list /etc/apt/sources.list
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/rhino-server /usr/local/bin/rhino-server

@@ -1,0 +1,11 @@
+[build.env]
+passthrough = ["http_proxy", "https_proxy", "no_proxy"]
+
+[target.x86_64-unknown-linux-gnu]
+image = "rhino-cross-x86_64:latest"
+
+[target.aarch64-unknown-linux-gnu]
+image = "rhino-cross-aarch64:latest"
+
+[target.x86_64-pc-windows-gnu]
+image = "ghcr.io/cross-rs/x86_64-pc-windows-gnu:main"
