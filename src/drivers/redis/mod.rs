@@ -1634,10 +1634,13 @@ impl Backend for RedisBackend {
         keys_only: bool,
     ) -> Result<(i64, Vec<KeyValue>)> {
         if !prefix.ends_with('/') {
-            let (rev, event) = self
-                .get_internal(prefix, revision, false, keys_only)
+            // Prefix match: return the key itself plus every key with this
+            // prefix (etcd readdir range [key, increment(key)) semantics).
+            let effective_start = if start_key == prefix { "" } else { start_key };
+            let (rev, events) = self
+                .list_internal(prefix, effective_start, limit, revision, false, keys_only, true)
                 .await?;
-            let kvs = event.map(|e| vec![e.kv]).unwrap_or_default();
+            let kvs = events.into_iter().map(|e| e.kv).collect();
             return Ok((rev, kvs));
         }
 
@@ -1653,9 +1656,13 @@ impl Backend for RedisBackend {
 
     async fn count(&self, prefix: &str, start_key: &str, revision: i64) -> Result<(i64, i64)> {
         if !prefix.ends_with('/') {
-            let (rev, event) = self.get_internal(prefix, revision, false, true).await?;
-            let count = if event.is_some() { 1 } else { 0 };
-            return Ok((rev, count));
+            // Prefix match: count the key itself plus every key with this
+            // prefix (etcd readdir range [key, increment(key)) semantics).
+            let effective_start = if start_key == prefix { "" } else { start_key };
+            let (rev, events) = self
+                .list_internal(prefix, effective_start, 0, revision, false, true, true)
+                .await?;
+            return Ok((rev, events.len() as i64));
         }
 
         let effective_start = if start_key == prefix { "" } else { start_key };

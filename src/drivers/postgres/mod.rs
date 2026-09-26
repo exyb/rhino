@@ -847,11 +847,10 @@ impl Backend for PostgresBackend {
         revision: i64,
         keys_only: bool,
     ) -> Result<(i64, Vec<KeyValue>)> {
-        let like_prefix = if prefix.ends_with('/') {
-            format!("{}%", prefix.replace('_', "^_"))
-        } else {
-            prefix.replace('_', "^_")
-        };
+        // Prefix match: a prefix that does not end with '/' covers the key
+        // itself plus every key with that prefix (etcd readdir range
+        // [key, increment(key)) semantics).
+        let like_prefix = format!("{}%", prefix.replace('_', "^_"));
 
         let translated_start = translate_start_key(start_key);
 
@@ -872,11 +871,8 @@ impl Backend for PostgresBackend {
     }
 
     async fn count(&self, prefix: &str, start_key: &str, revision: i64) -> Result<(i64, i64)> {
-        let like_prefix = if prefix.ends_with('/') {
-            format!("{}%", prefix.replace('_', "^_"))
-        } else {
-            prefix.replace('_', "^_")
-        };
+        // Prefix match (see list).
+        let like_prefix = format!("{}%", prefix.replace('_', "^_"));
 
         let translated_start = translate_start_key(start_key);
 

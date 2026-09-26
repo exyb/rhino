@@ -1274,13 +1274,16 @@ impl Backend for SqliteBackend {
         keys_only: bool,
     ) -> Result<(i64, Vec<KeyValue>)> {
         // Match kine's prefix/startKey handling:
-        // - If prefix ends with '/' and startKey == prefix, clear startKey
-        // - If prefix doesn't end with '/', clear startKey entirely
+        // - Prefixes ending with '/' are directory scans: LIKE 'prefix%'
+        //   with startKey as a lower bound.
+        // - Other prefixes are prefix matches as well (e.g. the etcd readdir
+        //   range [key, increment(key)) = the key itself + everything under
+        //   it): LIKE 'prefix%' with startKey cleared.
         let (like_prefix, effective_start) = if prefix.ends_with('/') {
             let sk = if start_key == prefix { "" } else { start_key };
             (format!("{}%", prefix.replace('_', "^_")), sk)
         } else {
-            (prefix.replace('_', "^_"), "")
+            (format!("{}%", prefix.replace('_', "^_")), "")
         };
 
         let (rev, events) = self
@@ -1300,11 +1303,9 @@ impl Backend for SqliteBackend {
     }
 
     async fn count(&self, prefix: &str, start_key: &str, revision: i64) -> Result<(i64, i64)> {
-        let like_prefix = if prefix.ends_with('/') {
-            format!("{}%", prefix.replace('_', "^_"))
-        } else {
-            prefix.replace('_', "^_")
-        };
+        // Prefix match: count the key itself plus every key with this prefix
+        // (etcd range [key, increment(key)) semantics).
+        let like_prefix = format!("{}%", prefix.replace('_', "^_"));
 
         // Match kine's prefix/startKey handling
         let effective_start = if prefix.ends_with('/') {

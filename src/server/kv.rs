@@ -34,6 +34,34 @@ fn to_proto_kvs(kv: Option<&BackendKv>) -> Vec<mvccpb::KeyValue> {
     kv.map(|kv| vec![to_proto_kv(kv)]).unwrap_or_default()
 }
 
+/// Detect the range pattern lua-resty-etcd sends for `readdir` — which
+/// APISIX uses for BOTH single-key gets (`core.etcd.get(key)` calls
+/// `etcd_cli:readdir(key)`) and directory reads:
+/// `range_end` is `key` with its last byte incremented by 1.
+///
+/// Per etcd semantics the range [key, increment(key)) covers the key
+/// itself plus every key with that prefix — exactly the union both
+/// request kinds expect, so `handle_list` can serve both when drivers
+/// treat a prefix that does not end with '/' as a prefix match.
+///
+/// Examples (all matched):
+///   key="/apisix/routes/1",                    range_end="/apisix/routes/2"
+///   key="/apisix/routes/00000000000000000033",  range_end="/apisix/routes/00000000000000000034"
+///   key="/apisix/routes",                     range_end="/apisix/routet"
+fn is_readdir_pattern(key: &[u8], range_end: &[u8]) -> bool {
+    if key.len() != range_end.len() || key.len() < 2 {
+        return false;
+    }
+    // All bytes except the last must be equal
+    if key[..key.len() - 1] != range_end[..range_end.len() - 1] {
+        return false;
+    }
+    // The last byte of range_end must be the last byte of key + 1
+    let last_key = key[key.len() - 1];
+    let last_range = range_end[range_end.len() - 1];
+    last_range == last_key.wrapping_add(1)
+}
+
 fn backend_err_to_status(e: BackendError) -> Status {
     match e {
         BackendError::KeyExists => Status::failed_precondition(e.to_string()),
@@ -245,51 +273,25 @@ fn extract_trailing_ranges(success: &[RequestOp]) -> Vec<RangeRequest> {
 }
 
 impl<B: Backend> KvBridge<B> {
-    /// Detect the single-key lookup pattern used by lua-resty-etcd's readdir:
-    /// range_end is key with its last byte incremented by 1.
-    ///
-    /// To distinguish from a prefix query (which uses the same range_end pattern),
-    /// we also require that the byte before the last byte of key is '/'.
-    /// This works because APISIX builds single-key paths as "/<resource>/<id>",
-    /// while prefix paths are just "/<resource>".
-    ///
-    /// Examples:
-    ///   Single key: key="/apisix/routes/1" -> range_end="/apisix/routes/2"  (matched)
-    ///   Prefix:     key="/apisix/routes"  -> range_end="/apisix/routet"  (not matched)
-    fn is_single_key_lookup(key: &[u8], range_end: &[u8]) -> bool {
-        if key.len() != range_end.len() || key.len() < 2 {
-            return false;
-        }
-        // The byte before the last must be '/' to distinguish from prefix queries
-        if key[key.len() - 2] != b'/' {
-            return false;
-        }
-        // All bytes except the last must be equal
-        if key[..key.len() - 1] != range_end[..range_end.len() - 1] {
-            return false;
-        }
-        // The last byte of range_end must be last byte of key + 1
-        let last_key = key[key.len() - 1];
-        let last_range = range_end[range_end.len() - 1];
-        last_range == last_key.wrapping_add(1)
-    }
-
     async fn handle_range(&self, r: &RangeRequest) -> Result<RangeResponse, Status> {
         let key_str = String::from_utf8_lossy(&r.key);
         let range_end_empty = r.range_end.is_empty();
-        let is_single = range_end_empty && !key_str.ends_with('/')
-            || !range_end_empty && Self::is_single_key_lookup(&r.key, &r.range_end);
+        let is_single = range_end_empty && !key_str.ends_with('/');
         tracing::info!("handle_range: key={:?}, range_end={:?}, is_single={}",
             key_str, String::from_utf8_lossy(&r.range_end), is_single);
 
-        // Distinguish single key lookup vs prefix query:
+        // Distinguish single key lookup vs prefix/range query:
         // - If range_end is empty AND key does NOT end with '/', it's a single key lookup
         //   e.g. key="/apisix/routes/1" -> handle_get
-        // - If range_end is key with last byte + 1 (lua-resty-etcd readdir pattern),
-        //   it's also a single key lookup
-        //   e.g. key="/apisix/routes/1", range_end="/apisix/routes/2" -> handle_get
         // - If range_end is empty AND key ends with '/', it's a prefix query
         //   e.g. key="/apisix/routes/" -> handle_list
+        // - If range_end is key with its last byte + 1 (lua-resty-etcd readdir
+        //   pattern), the range [key, increment(key)) covers the key itself
+        //   plus everything under it. Single-key gets and directory reads share
+        //   this exact shape, so route them all to handle_list, which returns
+        //   the union either way.
+        //   e.g. key="/apisix/routes/00000000000000000033",
+        //        range_end="/apisix/routes/00000000000000000034" -> handle_list
         // - Otherwise, it's a range/prefix query
         if is_single {
             tracing::info!("handle_range: routing to handle_get (single key)");
@@ -352,6 +354,12 @@ impl<B: Backend> KvBridge<B> {
                 s.push('/');
             }
             s
+        } else if is_readdir_pattern(&r.key, range_end) {
+            // lua-resty-etcd readdir pattern: the range is [key, increment(key)),
+            // i.e. the key itself plus every key with prefix `key`. Drivers
+            // match prefixes for keys that do not end with '/', so passing
+            // `key` as the prefix returns the whole set in one query.
+            key_str.to_string()
         } else {
             let mut p = range_end.clone();
             if let Some(last) = p.last_mut() {
@@ -406,12 +414,20 @@ impl<B: Backend> KvBridge<B> {
             "/apisix/ssls/",
             "/apisix/consumers/",
         ];
-        let needs_init_dir = INIT_DIR_PREFIXES.iter().any(|p| prefix.starts_with(p));
+        // A bare resource key like "/apisix/routes" refers to the directory
+        // "/apisix/routes/" — normalize before matching and before fetching
+        // the init_dir marker.
+        let dir_prefix = if prefix.ends_with('/') {
+            prefix.clone()
+        } else {
+            format!("{}/", prefix)
+        };
+        let needs_init_dir = INIT_DIR_PREFIXES.iter().any(|p| dir_prefix.starts_with(p));
         if kvs.is_empty() && needs_init_dir {
-            // init_dir marker 的 key 就是 prefix 本身（带尾部 /），如 /apisix/services/
-            if let Ok((_, Some(init_kv))) = self.backend.get(&prefix, "", 1, 0, false).await {
+            // init_dir marker 的 key 就是目录 prefix 本身（带尾部 /），如 /apisix/services/
+            if let Ok((_, Some(init_kv))) = self.backend.get(&dir_prefix, "", 1, 0, false).await {
                 if init_kv.value == b"init_dir" {
-                    tracing::info!("handle_list: injecting init_dir for empty dir {}", prefix);
+                    tracing::info!("handle_list: injecting init_dir for empty dir {}", dir_prefix);
                     kvs.push(init_kv);
                 }
             }
@@ -931,5 +947,55 @@ impl<B: Backend> Kv for KvBridge<B> {
         Ok(Response::new(CompactionResponse {
             header: response_header(rev),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_readdir_pattern() {
+        // Single-char ID (the case that always worked).
+        assert!(is_readdir_pattern(
+            b"/apisix/routes/1",
+            b"/apisix/routes/2"
+        ));
+        // Multi-digit IDs (APISIX 3.x zero-padded IDs — the bug case).
+        assert!(is_readdir_pattern(
+            b"/apisix/routes/33",
+            b"/apisix/routes/34"
+        ));
+        assert!(is_readdir_pattern(
+            b"/apisix/routes/00000000000000000033",
+            b"/apisix/routes/00000000000000000034"
+        ));
+        // Directory reads (no trailing slash / trailing slash).
+        assert!(is_readdir_pattern(
+            b"/apisix/routes",
+            b"/apisix/routet"
+        ));
+        assert!(is_readdir_pattern(
+            b"/apisix/routes/",
+            b"/apisix/routes0"
+        ));
+
+        // Not the readdir pattern.
+        assert!(!is_readdir_pattern(b"/apisix/routes/1", b""));
+        assert!(!is_readdir_pattern(b"", b""));
+        // Unrelated range_end.
+        assert!(!is_readdir_pattern(
+            b"/apisix/routes/1",
+            b"/apisix/routes/9"
+        ));
+        // Differing prefix.
+        assert!(!is_readdir_pattern(
+            b"/apisix/routes/1",
+            b"/apisix/routeu/2"
+        ));
+        // Last byte wrap (0xff + 1 = 0x00).
+        assert!(is_readdir_pattern(b"/a\xff", b"/a\x00"));
+        // Length mismatch.
+        assert!(!is_readdir_pattern(b"/apisix/routes/1", b"/apisix/routes/12"));
     }
 }
