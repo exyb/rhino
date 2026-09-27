@@ -44,6 +44,8 @@ pub struct SqliteConfig {
     /// Maximum number of connections in the pool. Defaults to 5.
     /// SQLite serializes writes, so large pools just increase lock contention.
     pub max_connections: u32,
+    /// Name of the kine table. Defaults to `"kine"`.
+    pub kine_table_name: String,
 }
 
 impl Default for SqliteConfig {
@@ -54,6 +56,7 @@ impl Default for SqliteConfig {
             compact_min_retain: COMPACT_MIN_RETAIN,
             compact_batch_size: COMPACT_BATCH_SIZE,
             max_connections: 5,
+            kine_table_name: "kine".to_string(),
         }
     }
 }
@@ -109,6 +112,22 @@ impl Broadcaster {
     }
 }
 
+/// Validate a table name to prevent SQL injection via identifier interpolation.
+/// Only allows ASCII alphanumeric characters and underscores.
+fn validate_table_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(BackendError::Internal(format!(
+            "invalid table name '{}': only alphanumeric and underscore allowed",
+            name
+        )));
+    }
+    Ok(())
+}
+
 /// SQLite-backed implementation of the rhino [`Backend`] trait.
 pub struct SqliteBackend {
     pool: SqlitePool,
@@ -126,6 +145,8 @@ impl SqliteBackend {
     /// The database file and pool are created immediately, but schema
     /// initialization and background tasks require calling [`Backend::start`].
     pub async fn new(config: SqliteConfig) -> std::result::Result<Self, BackendError> {
+        validate_table_name(&config.kine_table_name)?;
+
         // Ensure parent directory exists
         if let Some(parent) = std::path::Path::new(&config.dsn).parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
@@ -175,8 +196,11 @@ impl SqliteBackend {
     }
 
     async fn setup_schema(&self) -> Result<()> {
+        let kine_table = &self.config.kine_table_name;
+
         let statements = [
-            "CREATE TABLE IF NOT EXISTS kine (
+            format!(
+                "CREATE TABLE IF NOT EXISTS {kine_table} (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name INTEGER,
                 created INTEGER,
@@ -186,17 +210,14 @@ impl SqliteBackend {
                 lease INTEGER,
                 value BLOB,
                 old_value BLOB
-            )",
-            "CREATE TABLE IF NOT EXISTS kine_current (
-                name TEXT PRIMARY KEY,
-                id INTEGER NOT NULL
-            )",
-            "CREATE INDEX IF NOT EXISTS kine_name_index ON kine (name)",
-            "CREATE INDEX IF NOT EXISTS kine_name_id_index ON kine (name, id)",
-            "CREATE INDEX IF NOT EXISTS kine_id_deleted_index ON kine (id, deleted)",
-            "CREATE INDEX IF NOT EXISTS kine_prev_revision_index ON kine (prev_revision)",
-            "CREATE UNIQUE INDEX IF NOT EXISTS kine_name_prev_revision_uindex ON kine (name, prev_revision)",
-            "CREATE INDEX IF NOT EXISTS kine_id_compact_rev_key_with_prev_revision_index ON kine(id, name, prev_revision) WHERE name != 'compact_rev_key' AND prev_revision != 0",
+            )"
+            ),
+            format!("CREATE INDEX IF NOT EXISTS {kine_table}_name_index ON {kine_table} (name)"),
+            format!("CREATE INDEX IF NOT EXISTS {kine_table}_name_id_index ON {kine_table} (name, id)"),
+            format!("CREATE INDEX IF NOT EXISTS {kine_table}_id_deleted_index ON {kine_table} (id, deleted)"),
+            format!("CREATE INDEX IF NOT EXISTS {kine_table}_prev_revision_index ON {kine_table} (prev_revision)"),
+            format!("CREATE UNIQUE INDEX IF NOT EXISTS {kine_table}_name_prev_revision_uindex ON {kine_table} (name, prev_revision)"),
+            format!("CREATE INDEX IF NOT EXISTS {kine_table}_id_compact_rev_key_with_prev_revision_index ON {kine_table}(id, name, prev_revision) WHERE name != 'compact_rev_key' AND prev_revision != 0"),
         ];
 
         for stmt in &statements {
@@ -206,26 +227,20 @@ impl SqliteBackend {
                 .map_err(|e| BackendError::Internal(format!("schema setup failed: {e}")))?;
         }
 
-        // Populate kine_current from existing data (migration for existing databases)
-        sqlx::query(
-            "INSERT OR REPLACE INTO kine_current (name, id)
-             SELECT name, MAX(id) FROM kine GROUP BY name",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| BackendError::Internal(format!("kine_current migration failed: {e}")))?;
-
         debug!("database schema and indexes are up to date");
         Ok(())
     }
 
     async fn ensure_compact_rev_key(&self) -> Result<()> {
+        let kine_table = &self.config.kine_table_name;
+
         // Count compact_rev_key entries
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM kine WHERE name = ?")
-            .bind(COMPACT_REV_KEY)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| BackendError::Internal(e.to_string()))?;
+        let count: (i64,) =
+            sqlx::query_as(&format!("SELECT COUNT(*) FROM {kine_table} WHERE name = ?"))
+                .bind(COMPACT_REV_KEY)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| BackendError::Internal(e.to_string()))?;
 
         if count.0 == 0 {
             self.insert(COMPACT_REV_KEY, true, false, 0, 0, 0, b"", b"")
@@ -233,11 +248,11 @@ impl SqliteBackend {
         } else if count.0 > 1 {
             // Clean up duplicate compact_rev_key rows (matching kine's compactStart).
             // Keep only the one with the highest prev_revision.
-            sqlx::query(
-                "DELETE FROM kine WHERE name = ? AND id NOT IN (
-                    SELECT id FROM kine WHERE name = ? ORDER BY prev_revision DESC LIMIT 1
-                )",
-            )
+            sqlx::query(&format!(
+                "DELETE FROM {kine_table} WHERE name = ? AND id NOT IN (
+                    SELECT id FROM {kine_table} WHERE name = ? ORDER BY prev_revision DESC LIMIT 1
+                )"
+            ))
             .bind(COMPACT_REV_KEY)
             .bind(COMPACT_REV_KEY)
             .execute(&self.pool)
@@ -264,10 +279,11 @@ impl SqliteBackend {
         let c = if create { 1i32 } else { 0 };
         let d = if delete { 1i32 } else { 0 };
 
-        let result = sqlx::query(
-            "INSERT INTO kine(name, created, deleted, create_revision, prev_revision, lease, value, old_value)
+        let result = sqlx::query(&format!(
+            "INSERT INTO {}(name, created, deleted, create_revision, prev_revision, lease, value, old_value)
              VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
-        )
+            self.config.kine_table_name
+        ))
         .bind(key)
         .bind(c)
         .bind(d)
@@ -290,17 +306,6 @@ impl SqliteBackend {
 
         let id = result.last_insert_rowid();
 
-        // Update kine_current to point to this latest revision
-        sqlx::query(
-            "INSERT INTO kine_current (name, id) VALUES (?, ?)
-             ON CONFLICT(name) DO UPDATE SET id = excluded.id",
-        )
-        .bind(key)
-        .bind(id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| BackendError::Internal(format!("kine_current update failed: {e}")))?;
-
         self.current_rev.store(id, Ordering::Release);
         self.notify.notify_waiters();
         Ok(id)
@@ -309,10 +314,11 @@ impl SqliteBackend {
     /// Fill a gap at the given revision with a placeholder record.
     async fn fill(&self, revision: i64) -> Result<()> {
         let name = format!("gap-{revision}");
-        sqlx::query(
-            "INSERT INTO kine(id, name, created, deleted, create_revision, prev_revision, lease, value, old_value)
+        sqlx::query(&format!(
+            "INSERT INTO {}(id, name, created, deleted, create_revision, prev_revision, lease, value, old_value)
              VALUES(?, ?, 0, 1, 0, 0, 0, NULL, NULL)",
-        )
+            self.config.kine_table_name
+        ))
         .bind(revision)
         .bind(&name)
         .execute(&self.pool)
@@ -323,21 +329,26 @@ impl SqliteBackend {
 
     /// Get the current (max) revision from the database.
     async fn db_current_revision(&self) -> Result<i64> {
-        let row: (Option<i64>,) = sqlx::query_as("SELECT MAX(id) FROM kine")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| BackendError::Internal(e.to_string()))?;
+        let row: (Option<i64>,) = sqlx::query_as(&format!(
+            "SELECT MAX(id) FROM {}",
+            self.config.kine_table_name
+        ))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| BackendError::Internal(e.to_string()))?;
         Ok(row.0.unwrap_or(0))
     }
 
     /// Get the compact revision from the database.
     async fn get_compact_revision(&self) -> Result<i64> {
-        let row: (Option<i64>,) =
-            sqlx::query_as("SELECT MAX(prev_revision) FROM kine WHERE name = ?")
-                .bind(COMPACT_REV_KEY)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| BackendError::Internal(e.to_string()))?;
+        let row: (Option<i64>,) = sqlx::query_as(&format!(
+            "SELECT MAX(prev_revision) FROM {} WHERE name = ?",
+            self.config.kine_table_name
+        ))
+        .bind(COMPACT_REV_KEY)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| BackendError::Internal(e.to_string()))?;
         Ok(row.0.unwrap_or(0))
     }
 
@@ -358,8 +369,7 @@ impl SqliteBackend {
     }
 
     /// Core list query. Returns (current_revision, events).
-    /// For current-revision queries (revision == 0), uses kine_current for O(keys) lookup.
-    /// For historical queries (revision > 0), falls back to MAX(id) GROUP BY subquery.
+    /// Uses a MAX(id) GROUP BY subquery to find the latest version of each key.
     ///
     /// `filter_init_dir`: when true, excludes etcd v2 init_dir placeholder records.
     /// List/count queries pass true; get_internal (used by create/delete/update) passes false
@@ -385,6 +395,7 @@ impl SqliteBackend {
             return Err(BackendError::Compacted);
         }
 
+        let kine_table = &self.config.kine_table_name;
         let value_cols = if keys_only {
             ""
         } else {
@@ -399,111 +410,72 @@ impl SqliteBackend {
 
         let include_deleted_val: i32 = if include_deleted { 1 } else { 0 };
 
-        let rows = if revision == 0 {
-            // Current-revision query: use kine_current table (O(matching_keys))
-            let start_where = if start_key.is_empty() {
-                String::new()
-            } else {
-                "AND cur.name >= ?".to_string()
-            };
-
-            // Filter out etcd v2 init_dir placeholder records at the SQL level.
-            // These are directory markers (value = 'init_dir'), not real data.
-            let init_dir_filter = if filter_init_dir {
-                "AND (kv.value IS NULL OR kv.value != ?)"
-            } else {
-                ""
-            };
-
-            let sql = format!(
-                "SELECT
-                    kv.id AS theid,
-                    kv.name AS thename,
-                    kv.created,
-                    kv.deleted,
-                    kv.create_revision,
-                    kv.prev_revision,
-                    kv.lease
-                    {value_cols}
-                FROM kine AS kv
-                JOIN kine_current AS cur ON cur.id = kv.id
-                WHERE cur.name LIKE ? ESCAPE '^'
-                {start_where}
-                AND (kv.deleted = 0 OR ?)
-                {init_dir_filter}
-                ORDER BY kv.name ASC
-                {limit_clause}"
-            );
-
-            if start_key.is_empty() {
-                let mut q = sqlx::query(&sql).bind(prefix).bind(include_deleted_val);
-                if filter_init_dir {
-                    q = q.bind(INIT_DIR_MARKER);
-                }
-                q.fetch_all(&self.pool).await
-            } else {
-                let mut q = sqlx::query(&sql).bind(prefix).bind(start_key).bind(include_deleted_val);
-                if filter_init_dir {
-                    q = q.bind(INIT_DIR_MARKER);
-                }
-                q.fetch_all(&self.pool).await
-            }
+        let start_where = if start_key.is_empty() {
+            String::new()
         } else {
-            // Historical query: must scan revisions up to the requested revision
-            let start_where = if start_key.is_empty() {
-                String::new()
-            } else {
-                "AND mkv.name >= ?".to_string()
-            };
+            "AND mkv.name >= ?".to_string()
+        };
 
-            let init_dir_filter_hist = if filter_init_dir {
-                "AND (kv.value IS NULL OR kv.value != ?)"
-            } else {
-                ""
-            };
+        let init_dir_filter = if filter_init_dir {
+            "AND (kv.value IS NULL OR kv.value != ?)"
+        } else {
+            ""
+        };
 
-            let sql = format!(
-                "SELECT
-                    kv.id AS theid,
-                    kv.name AS thename,
-                    kv.created,
-                    kv.deleted,
-                    kv.create_revision,
-                    kv.prev_revision,
-                    kv.lease
-                    {value_cols}
-                FROM kine AS kv
-                JOIN (
-                    SELECT MAX(mkv.id) AS id
-                    FROM kine AS mkv
-                    WHERE mkv.name LIKE ? ESCAPE '^'
-                    {start_where}
-                    AND mkv.id <= ?
-                    GROUP BY mkv.name
-                ) AS maxkv ON maxkv.id = kv.id
-                WHERE (kv.deleted = 0 OR ?)
-                {init_dir_filter_hist}
-                ORDER BY kv.name ASC
-                {limit_clause}"
-            );
+        let max_rev_constraint = if revision > 0 {
+            "AND mkv.id <= ?"
+        } else {
+            ""
+        };
 
-            if start_key.is_empty() {
-                let mut q = sqlx::query(&sql).bind(prefix).bind(revision).bind(include_deleted_val);
-                if filter_init_dir {
-                    q = q.bind(INIT_DIR_MARKER);
-                }
-                q.fetch_all(&self.pool).await
-            } else {
-                let mut q = sqlx::query(&sql)
-                    .bind(prefix)
-                    .bind(start_key)
-                    .bind(revision)
-                    .bind(include_deleted_val);
-                if filter_init_dir {
-                    q = q.bind(INIT_DIR_MARKER);
-                }
-                q.fetch_all(&self.pool).await
+        let sql = format!(
+            "SELECT
+                kv.id AS theid,
+                kv.name AS thename,
+                kv.created,
+                kv.deleted,
+                kv.create_revision,
+                kv.prev_revision,
+                kv.lease
+                {value_cols}
+            FROM {kine_table} AS kv
+            JOIN (
+                SELECT MAX(mkv.id) AS id
+                FROM {kine_table} AS mkv
+                WHERE mkv.name LIKE ? ESCAPE '^'
+                {start_where}
+                {max_rev_constraint}
+                GROUP BY mkv.name
+            ) AS maxkv ON maxkv.id = kv.id
+            WHERE (kv.deleted = 0 OR ?)
+            {init_dir_filter}
+            ORDER BY kv.name ASC
+            {limit_clause}"
+        );
+
+        let rows = if start_key.is_empty() {
+            let mut q = sqlx::query(&sql)
+                .bind(prefix)
+                .bind(include_deleted_val);
+            if revision > 0 {
+                q = q.bind(revision);
             }
+            if filter_init_dir {
+                q = q.bind(INIT_DIR_MARKER);
+            }
+            q.fetch_all(&self.pool).await
+        } else {
+            let mut q = sqlx::query(&sql)
+                .bind(prefix)
+                .bind(start_key)
+                .bind(include_deleted_val);
+            if revision > 0 {
+                q = q.bind(revision);
+            }
+            if filter_init_dir {
+                q = q.bind(INIT_DIR_MARKER);
+            }
+            q.fetch_all(&self.pool).await
         }
         .map_err(|e| BackendError::Internal(e.to_string()))?;
 
@@ -539,10 +511,11 @@ impl SqliteBackend {
                 kv.lease,
                 kv.value,
                 kv.old_value
-            FROM kine AS kv
+            FROM {} AS kv
             WHERE kv.id > ?
             ORDER BY kv.id ASC
-            {limit_clause}"
+            {limit_clause}",
+            self.config.kine_table_name
         );
 
         let rows = sqlx::query(&sql)
@@ -878,12 +851,17 @@ impl SqliteBackend {
         let mut expiries: HashMap<String, (i64, Instant)> = HashMap::new();
 
         // Seed from existing leased keys
-        let rows = sqlx::query_as::<_, (String, i64, i64)>(
+        let rows = sqlx::query_as::<_, (String, i64, i64)>(&format!(
             "SELECT kv.name, kv.lease, kv.id
-             FROM kine AS kv
-             JOIN kine_current AS cur ON cur.id = kv.id
+             FROM {} AS kv
+             JOIN (
+                 SELECT MAX(mkv.id) AS id
+                 FROM {} AS mkv
+                 GROUP BY mkv.name
+             ) AS maxkv ON maxkv.id = kv.id
              WHERE kv.lease > 0 AND kv.deleted = 0",
-        )
+            self.config.kine_table_name, self.config.kine_table_name
+        ))
         .fetch_all(&self.pool)
         .await
         .unwrap_or_default();
@@ -1019,28 +997,33 @@ impl SqliteBackend {
                 .map_err(|e| BackendError::Internal(e.to_string()))?;
 
             // Verify compact_rev hasn't changed (another compactor may have run)
-            let db_compact: (Option<i64>,) =
-                sqlx::query_as("SELECT MAX(prev_revision) FROM kine WHERE name = ?")
-                    .bind(COMPACT_REV_KEY)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(|e| BackendError::Internal(e.to_string()))?;
+            let db_compact: (Option<i64>,) = sqlx::query_as(&format!(
+                "SELECT MAX(prev_revision) FROM {} WHERE name = ?",
+                self.config.kine_table_name
+            ))
+            .bind(COMPACT_REV_KEY)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| BackendError::Internal(e.to_string()))?;
             if db_compact.0.unwrap_or(0) != compact_rev {
                 return Err(BackendError::Compacted);
             }
 
             // Delete superseded revisions and deleted entries up to iter_rev
-            let deleted = sqlx::query(
-                "DELETE FROM kine WHERE id IN (
+            let deleted = sqlx::query(&format!(
+                "DELETE FROM {} WHERE id IN (
                     SELECT kp.prev_revision AS id
-                    FROM kine AS kp
+                    FROM {} AS kp
                     WHERE kp.name != ? AND kp.prev_revision != 0 AND kp.id <= ?
                     UNION
                     SELECT kd.id AS id
-                    FROM kine AS kd
+                    FROM {} AS kd
                     WHERE kd.deleted != 0 AND kd.id <= ?
                 )",
-            )
+                self.config.kine_table_name,
+                self.config.kine_table_name,
+                self.config.kine_table_name
+            ))
             .bind(COMPACT_REV_KEY)
             .bind(iter_rev)
             .bind(iter_rev)
@@ -1048,32 +1031,16 @@ impl SqliteBackend {
             .await
             .map_err(|e| BackendError::Internal(e.to_string()))?;
 
-            // Clean up kine_current: remove entries whose kine rows were deleted
-            let cleaned = sqlx::query(
-                "DELETE FROM kine_current WHERE name IN (
-                    SELECT cur.name FROM kine_current AS cur
-                    LEFT JOIN kine AS kv ON cur.id = kv.id
-                    WHERE kv.id IS NULL
-                )",
-            )
+            // Update compact_rev_key
+            sqlx::query(&format!(
+                "UPDATE {} SET prev_revision = ? WHERE name = ?",
+                self.config.kine_table_name
+            ))
+            .bind(iter_rev)
+            .bind(COMPACT_REV_KEY)
             .execute(&mut *tx)
             .await
             .map_err(|e| BackendError::Internal(e.to_string()))?;
-
-            if cleaned.rows_affected() > 0 {
-                debug!(
-                    "cleaned {} dangling kine_current entries",
-                    cleaned.rows_affected()
-                );
-            }
-
-            // Update compact_rev_key
-            sqlx::query("UPDATE kine SET prev_revision = ? WHERE name = ?")
-                .bind(iter_rev)
-                .bind(COMPACT_REV_KEY)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| BackendError::Internal(e.to_string()))?;
 
             tx.commit()
                 .await
@@ -1161,12 +1128,15 @@ impl Backend for SqliteBackend {
 
         // Patch create_revision to the new row id so it's non-zero and gets
         // serialized by protobuf (protobuf 3 omits default value 0).
-        sqlx::query("UPDATE kine SET create_revision = ? WHERE id = ?")
-            .bind(new_rev)
-            .bind(new_rev)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| BackendError::Internal(format!("create_revision patch failed: {e}")))?;
+        sqlx::query(&format!(
+            "UPDATE {} SET create_revision = ? WHERE id = ?",
+            self.config.kine_table_name
+        ))
+        .bind(new_rev)
+        .bind(new_rev)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| BackendError::Internal(format!("create_revision patch failed: {e}")))?;
 
         Ok(new_rev)
     }
@@ -1218,14 +1188,19 @@ impl Backend for SqliteBackend {
         let like_prefix = format!("{}%", prefix.replace('_', "^_"));
 
         // Fetch all live keys matching the prefix
-        let rows = sqlx::query(
+        let rows = sqlx::query(&format!(
             "SELECT kv.id, kv.name, kv.create_revision, kv.value, kv.lease
-             FROM kine AS kv
-             JOIN kine_current AS cur ON cur.id = kv.id
-             WHERE cur.name LIKE ? ESCAPE '^'
+             FROM {} AS kv
+             JOIN (
+                 SELECT MAX(mkv.id) AS id
+                 FROM {} AS mkv
+                 GROUP BY mkv.name
+             ) AS maxkv ON maxkv.id = kv.id
+             WHERE kv.name LIKE ? ESCAPE '^'
              AND kv.deleted = 0
              ORDER BY kv.name ASC",
-        )
+            self.config.kine_table_name, self.config.kine_table_name
+        ))
         .bind(&like_prefix)
         .fetch_all(&self.pool)
         .await
@@ -1316,92 +1291,58 @@ impl Backend for SqliteBackend {
 
         let rev = self.cached_revision().await?;
 
-        if revision == 0 {
-            // Use kine_current for O(keys) count
-            let start_where = if effective_start.is_empty() {
-                String::new()
-            } else {
-                "AND cur.name >= ?".to_string()
-            };
-
-            // Filter out etcd v2 init_dir placeholder records
-            const INIT_DIR_FILTER: &str = "AND (kv.value IS NULL OR kv.value != ?)";
-
-            let sql = format!(
-                "SELECT COUNT(*)
-                FROM kine AS kv
-                JOIN kine_current AS cur ON cur.id = kv.id
-                WHERE cur.name LIKE ? ESCAPE '^'
-                {start_where}
-                AND kv.deleted = 0
-                {INIT_DIR_FILTER}"
-            );
-
-            let row = if effective_start.is_empty() {
-                sqlx::query_as::<_, (i64,)>(&sql)
-                    .bind(&like_prefix)
-                    .bind(INIT_DIR_MARKER)
-                    .fetch_one(&self.pool)
-                    .await
-            } else {
-                sqlx::query_as::<_, (i64,)>(&sql)
-                    .bind(&like_prefix)
-                    .bind(effective_start)
-                    .bind(INIT_DIR_MARKER)
-                    .fetch_one(&self.pool)
-                    .await
-            }
-            .map_err(|e| BackendError::Internal(e.to_string()))?;
-
-            Ok((rev, row.0))
+        let kine_table = &self.config.kine_table_name;
+        let start_where = if effective_start.is_empty() {
+            String::new()
         } else {
-            // Historical count via GROUP BY subquery
-            let start_where = if effective_start.is_empty() {
-                String::new()
-            } else {
-                "AND mkv.name >= ?".to_string()
-            };
+            "AND mkv.name >= ?".to_string()
+        };
 
-            const INIT_DIR_FILTER_HIST: &str = "AND (kv.value IS NULL OR kv.value != ?)";
+        // Filter out etcd v2 init_dir placeholder records
+        const INIT_DIR_FILTER: &str = "AND (kv.value IS NULL OR kv.value != ?)";
 
-            let sql = format!(
-                "SELECT COUNT(c.theid)
-                FROM (
-                    SELECT kv.id AS theid
-                    FROM kine AS kv
-                    JOIN (
-                        SELECT MAX(mkv.id) AS id
-                        FROM kine AS mkv
-                        WHERE mkv.name LIKE ? ESCAPE '^'
-                        {start_where}
-                        AND mkv.id <= ?
-                        GROUP BY mkv.name
-                    ) AS maxkv ON maxkv.id = kv.id
-                    WHERE kv.deleted = 0
-                    {INIT_DIR_FILTER_HIST}
-                ) c"
-            );
+        let max_rev_constraint = if revision > 0 {
+            "AND mkv.id <= ?"
+        } else {
+            ""
+        };
 
-            let row = if effective_start.is_empty() {
-                sqlx::query_as::<_, (i64,)>(&sql)
-                    .bind(&like_prefix)
-                    .bind(revision)
-                    .bind(INIT_DIR_MARKER)
-                    .fetch_one(&self.pool)
-                    .await
-            } else {
-                sqlx::query_as::<_, (i64,)>(&sql)
-                    .bind(&like_prefix)
-                    .bind(effective_start)
-                    .bind(revision)
-                    .bind(INIT_DIR_MARKER)
-                    .fetch_one(&self.pool)
-                    .await
+        let sql = format!(
+            "SELECT COUNT(kv.id)
+            FROM {kine_table} AS kv
+            JOIN (
+                SELECT MAX(mkv.id) AS id
+                FROM {kine_table} AS mkv
+                WHERE mkv.name LIKE ? ESCAPE '^'
+                {start_where}
+                {max_rev_constraint}
+                GROUP BY mkv.name
+            ) AS maxkv ON maxkv.id = kv.id
+            WHERE kv.deleted = 0
+            {INIT_DIR_FILTER}"
+        );
+
+        let row = if effective_start.is_empty() {
+            let mut q = sqlx::query_as::<_, (i64,)>(&sql)
+                .bind(&like_prefix)
+                .bind(INIT_DIR_MARKER);
+            if revision > 0 {
+                q = q.bind(revision);
             }
-            .map_err(|e| BackendError::Internal(e.to_string()))?;
-
-            Ok((rev, row.0))
+            q.fetch_one(&self.pool).await
+        } else {
+            let mut q = sqlx::query_as::<_, (i64,)>(&sql)
+                .bind(&like_prefix)
+                .bind(effective_start)
+                .bind(INIT_DIR_MARKER);
+            if revision > 0 {
+                q = q.bind(revision);
+            }
+            q.fetch_one(&self.pool).await
         }
+        .map_err(|e| BackendError::Internal(e.to_string()))?;
+
+        Ok((rev, row.0))
     }
 
     async fn update(
@@ -1475,6 +1416,7 @@ impl Backend for SqliteBackend {
         // First, send any historical events since the requested revision
         let start_rev = if revision > 0 { revision - 1 } else { 0 };
         let pool = self.pool.clone();
+        let kine_table_name = self.config.kine_table_name.clone();
 
         tokio::spawn(async move {
             // Tracks the highest revision we've delivered, so we can skip
@@ -1489,7 +1431,8 @@ impl Backend for SqliteBackend {
                     prefix.clone()
                 };
 
-                let sql = "SELECT
+                let sql = format!(
+                    "SELECT
                         kv.id AS theid,
                         kv.name AS thename,
                         kv.created,
@@ -1499,11 +1442,13 @@ impl Backend for SqliteBackend {
                         kv.lease,
                         kv.value,
                         kv.old_value
-                    FROM kine AS kv
+                    FROM {} AS kv
                     WHERE kv.name LIKE ? ESCAPE '^' AND kv.id > ?
-                    ORDER BY kv.id ASC";
+                    ORDER BY kv.id ASC",
+                    kine_table_name
+                );
 
-                if let Ok(rows) = sqlx::query(sql)
+                if let Ok(rows) = sqlx::query(&sql)
                     .bind(&after_prefix)
                     .bind(start_rev)
                     .fetch_all(&pool)
@@ -1651,17 +1596,20 @@ impl Backend for SqliteBackend {
             return Ok(current_rev);
         }
 
-        let deleted = sqlx::query(
-            "DELETE FROM kine WHERE id IN (
+        let deleted = sqlx::query(&format!(
+            "DELETE FROM {} WHERE id IN (
                 SELECT kp.prev_revision AS id
-                FROM kine AS kp
+                FROM {} AS kp
                 WHERE kp.name != ? AND kp.prev_revision != 0 AND kp.id <= ?
                 UNION
                 SELECT kd.id AS id
-                FROM kine AS kd
+                FROM {} AS kd
                 WHERE kd.deleted != 0 AND kd.id <= ?
             )",
-        )
+            self.config.kine_table_name,
+            self.config.kine_table_name,
+            self.config.kine_table_name
+        ))
         .bind(COMPACT_REV_KEY)
         .bind(target)
         .bind(target)
@@ -1669,24 +1617,15 @@ impl Backend for SqliteBackend {
         .await
         .map_err(|e| BackendError::Internal(e.to_string()))?;
 
-        // Clean up kine_current: remove entries whose kine rows were deleted
-        sqlx::query(
-            "DELETE FROM kine_current WHERE name IN (
-                SELECT cur.name FROM kine_current AS cur
-                LEFT JOIN kine AS kv ON cur.id = kv.id
-                WHERE kv.id IS NULL
-            )",
-        )
+        sqlx::query(&format!(
+            "UPDATE {} SET prev_revision = ? WHERE name = ?",
+            self.config.kine_table_name
+        ))
+        .bind(target)
+        .bind(COMPACT_REV_KEY)
         .execute(&self.pool)
         .await
         .map_err(|e| BackendError::Internal(e.to_string()))?;
-
-        sqlx::query("UPDATE kine SET prev_revision = ? WHERE name = ?")
-            .bind(target)
-            .bind(COMPACT_REV_KEY)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| BackendError::Internal(e.to_string()))?;
 
         debug!(
             "manual compact: deleted {} rows up to revision {}",

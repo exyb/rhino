@@ -41,6 +41,8 @@ pub struct MysqlConfig {
     pub compact_batch_size: i64,
     /// Maximum number of connections in the pool.
     pub max_connections: u32,
+    /// Name of the kine table. Defaults to `"kine"`.
+    pub kine_table_name: String,
 }
 
 impl Default for MysqlConfig {
@@ -51,8 +53,24 @@ impl Default for MysqlConfig {
             compact_min_retain: COMPACT_MIN_RETAIN,
             compact_batch_size: COMPACT_BATCH_SIZE,
             max_connections: 5,
+            kine_table_name: "kine".to_string(),
         }
     }
+}
+
+/// Validate a table name to prevent SQL injection via identifier interpolation.
+fn validate_table_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(BackendError::Internal(format!(
+            "invalid table name '{}': only alphanumeric and underscore allowed",
+            name
+        )));
+    }
+    Ok(())
 }
 
 /// MySQL-backed implementation of the rhino [`Backend`] trait.
@@ -69,6 +87,8 @@ pub struct MysqlBackend {
 impl MysqlBackend {
     /// Create a new MySQL backend with the given configuration.
     pub async fn new(config: MysqlConfig) -> std::result::Result<Self, BackendError> {
+        validate_table_name(&config.kine_table_name)?;
+
         let opts: MySqlConnectOptions = config
             .dsn
             .parse()
@@ -94,9 +114,11 @@ impl MysqlBackend {
     }
 
     async fn setup_schema(&self) -> Result<()> {
+        let k = &self.config.kine_table_name;
+
         // Create table
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS kine (
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {k} (
                 id BIGINT UNSIGNED AUTO_INCREMENT,
                 name VARCHAR(630) CHARACTER SET ascii,
                 created INTEGER,
@@ -107,8 +129,8 @@ impl MysqlBackend {
                 value MEDIUMBLOB,
                 old_value MEDIUMBLOB,
                 PRIMARY KEY (id)
-            )",
-        )
+            )"
+        ))
         .execute(&self.pool)
         .await
         .map_err(|e| BackendError::Internal(format!("schema setup failed: {e}")))?;
@@ -118,11 +140,11 @@ impl MysqlBackend {
         // The error detection checks both the SQL error code and the message
         // text as fallback, since some MySQL/MariaDB versions return code=None.
         let indexes = [
-            "CREATE INDEX kine_name_index ON kine (name)",
-            "CREATE INDEX kine_name_id_index ON kine (name, id)",
-            "CREATE INDEX kine_id_deleted_index ON kine (id, deleted)",
-            "CREATE INDEX kine_prev_revision_index ON kine (prev_revision)",
-            "CREATE UNIQUE INDEX kine_name_prev_revision_uindex ON kine (name, prev_revision)",
+            format!("CREATE INDEX {k}_name_index ON {k} (name)"),
+            format!("CREATE INDEX {k}_name_id_index ON {k} (name, id)"),
+            format!("CREATE INDEX {k}_id_deleted_index ON {k} (id, deleted)"),
+            format!("CREATE INDEX {k}_prev_revision_index ON {k} (prev_revision)"),
+            format!("CREATE UNIQUE INDEX {k}_name_prev_revision_uindex ON {k} (name, prev_revision)"),
         ];
 
         for stmt in &indexes {
@@ -144,11 +166,14 @@ impl MysqlBackend {
     }
 
     async fn ensure_compact_rev_key(&self) -> Result<()> {
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM kine WHERE name = ?")
-            .bind(COMPACT_REV_KEY)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| BackendError::Internal(e.to_string()))?;
+        let count: (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM {} WHERE name = ?",
+            self.config.kine_table_name
+        ))
+        .bind(COMPACT_REV_KEY)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| BackendError::Internal(e.to_string()))?;
 
         if count.0 == 0 {
             self.insert(COMPACT_REV_KEY, true, false, 0, 0, 0, b"", b"")
@@ -173,10 +198,11 @@ impl MysqlBackend {
         let c = if create { 1i32 } else { 0 };
         let d = if delete { 1i32 } else { 0 };
 
-        let result = sqlx::query(
-            "INSERT INTO kine(name, created, deleted, create_revision, prev_revision, lease, value, old_value)
+        let result = sqlx::query(&format!(
+            "INSERT INTO {}(name, created, deleted, create_revision, prev_revision, lease, value, old_value)
              VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
-        )
+            self.config.kine_table_name
+        ))
         .bind(key)
         .bind(c)
         .bind(d)
@@ -204,10 +230,11 @@ impl MysqlBackend {
     async fn fill(&self, revision: i64) -> Result<()> {
         let name = format!("gap-{revision}");
         // MySQL: INSERT IGNORE for conflict-safe gap filling
-        sqlx::query(
-            "INSERT IGNORE INTO kine(id, name, created, deleted, create_revision, prev_revision, lease, value, old_value)
+        sqlx::query(&format!(
+            "INSERT IGNORE INTO {}(id, name, created, deleted, create_revision, prev_revision, lease, value, old_value)
              VALUES(?, ?, 0, 1, 0, 0, 0, NULL, NULL)",
-        )
+            self.config.kine_table_name
+        ))
         .bind(revision)
         .bind(&name)
         .execute(&self.pool)
@@ -218,19 +245,22 @@ impl MysqlBackend {
 
     async fn db_current_revision(&self) -> Result<i64> {
         // CAST to SIGNED: id is BIGINT UNSIGNED, sqlx can't decode it as i64 directly.
-        let row: (Option<i64>,) =
-            sqlx::query_as("SELECT CAST(MAX(id) AS SIGNED) FROM kine")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| BackendError::Internal(e.to_string()))?;
+        let row: (Option<i64>,) = sqlx::query_as(&format!(
+            "SELECT CAST(MAX(id) AS SIGNED) FROM {}",
+            self.config.kine_table_name
+        ))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| BackendError::Internal(e.to_string()))?;
         Ok(row.0.unwrap_or(0))
     }
 
     async fn get_compact_revision(&self) -> Result<i64> {
         // CAST to SIGNED: prev_revision is BIGINT UNSIGNED.
-        let row: (Option<i64>,) = sqlx::query_as(
-            "SELECT CAST(MAX(prev_revision) AS SIGNED) FROM kine WHERE name = ?",
-        )
+        let row: (Option<i64>,) = sqlx::query_as(&format!(
+            "SELECT CAST(MAX(prev_revision) AS SIGNED) FROM {} WHERE name = ?",
+            self.config.kine_table_name
+        ))
         .bind(COMPACT_REV_KEY)
         .fetch_one(&self.pool)
         .await
@@ -301,10 +331,11 @@ impl MysqlBackend {
             ""
         };
 
+        let k = &self.config.kine_table_name;
         let sql = format!(
             "SELECT
-                (SELECT CAST(MAX(rkv.id) AS SIGNED) FROM kine AS rkv),
-                (SELECT CAST(MAX(crkv.prev_revision) AS SIGNED) FROM kine AS crkv WHERE crkv.name = '{COMPACT_REV_KEY}'),
+                (SELECT CAST(MAX(rkv.id) AS SIGNED) FROM {k} AS rkv),
+                (SELECT CAST(MAX(crkv.prev_revision) AS SIGNED) FROM {k} AS crkv WHERE crkv.name = '{COMPACT_REV_KEY}'),
                 CAST(kv.id AS SIGNED) AS theid,
                 kv.name AS thename,
                 kv.created,
@@ -313,10 +344,10 @@ impl MysqlBackend {
                 CAST(kv.prev_revision AS SIGNED),
                 kv.lease
                 {value_cols}
-            FROM kine AS kv
+            FROM {k} AS kv
             JOIN (
                 SELECT MAX(mkv.id) AS id
-                FROM kine AS mkv
+                FROM {k} AS mkv
                 WHERE mkv.name LIKE ? ESCAPE '^'
                 {extra_where}
                 GROUP BY mkv.name
@@ -387,10 +418,11 @@ impl MysqlBackend {
             String::new()
         };
 
+        let k = &self.config.kine_table_name;
         let sql = format!(
             "SELECT
-                (SELECT CAST(MAX(rkv.id) AS SIGNED) FROM kine AS rkv),
-                (SELECT CAST(MAX(crkv.prev_revision) AS SIGNED) FROM kine AS crkv WHERE crkv.name = '{COMPACT_REV_KEY}'),
+                (SELECT CAST(MAX(rkv.id) AS SIGNED) FROM {k} AS rkv),
+                (SELECT CAST(MAX(crkv.prev_revision) AS SIGNED) FROM {k} AS crkv WHERE crkv.name = '{COMPACT_REV_KEY}'),
                 CAST(kv.id AS SIGNED) AS theid,
                 kv.name AS thename,
                 kv.created,
@@ -400,7 +432,7 @@ impl MysqlBackend {
                 kv.lease,
                 kv.value,
                 kv.old_value
-            FROM kine AS kv
+            FROM {k} AS kv
             WHERE kv.name LIKE ? ESCAPE '^' AND kv.id > ?
             AND (kv.value IS NULL OR kv.value != ?)
             ORDER BY kv.id ASC
@@ -641,19 +673,22 @@ impl MysqlBackend {
                 .map_err(|e| BackendError::Internal(e.to_string()))?;
 
             // MySQL compact uses INNER JOIN (not USING or IN subquery)
-            let deleted = sqlx::query(
-                "DELETE kv FROM kine AS kv
+            let deleted = sqlx::query(&format!(
+                "DELETE kv FROM {} AS kv
                  INNER JOIN (
                     SELECT kp.prev_revision AS id
-                    FROM kine AS kp
+                    FROM {} AS kp
                     WHERE kp.name != ? AND kp.prev_revision != 0 AND kp.id <= ?
                     UNION
                     SELECT kd.id AS id
-                    FROM kine AS kd
+                    FROM {} AS kd
                     WHERE kd.deleted != 0 AND kd.id <= ?
                  ) AS ks
                  ON kv.id = ks.id",
-            )
+                self.config.kine_table_name,
+                self.config.kine_table_name,
+                self.config.kine_table_name
+            ))
             .bind(COMPACT_REV_KEY)
             .bind(iter_rev)
             .bind(iter_rev)
@@ -661,12 +696,15 @@ impl MysqlBackend {
             .await
             .map_err(|e| BackendError::Internal(e.to_string()))?;
 
-            sqlx::query("UPDATE kine SET prev_revision = ? WHERE name = ?")
-                .bind(iter_rev)
-                .bind(COMPACT_REV_KEY)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| BackendError::Internal(e.to_string()))?;
+            sqlx::query(&format!(
+                "UPDATE {} SET prev_revision = ? WHERE name = ?",
+                self.config.kine_table_name
+            ))
+            .bind(iter_rev)
+            .bind(COMPACT_REV_KEY)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| BackendError::Internal(e.to_string()))?;
 
             tx.commit()
                 .await
@@ -973,6 +1011,7 @@ impl Backend for MysqlBackend {
         let prefix = key.to_string();
         let start_rev = if revision > 0 { revision - 1 } else { 0 };
         let pool = self.pool.clone();
+        let kine_table_name = self.config.kine_table_name.clone();
 
         tokio::spawn(async move {
             if start_rev > 0 {
@@ -982,10 +1021,10 @@ impl Backend for MysqlBackend {
                     prefix.clone()
                 };
 
-                let sql =
+                let sql = format!(
                     "SELECT
-                        (SELECT CAST(MAX(rkv.id) AS SIGNED) FROM kine AS rkv),
-                        (SELECT CAST(MAX(crkv.prev_revision) AS SIGNED) FROM kine AS crkv WHERE crkv.name = 'compact_rev_key'),
+                        (SELECT CAST(MAX(rkv.id) AS SIGNED) FROM {} AS rkv),
+                        (SELECT CAST(MAX(crkv.prev_revision) AS SIGNED) FROM {} AS crkv WHERE crkv.name = 'compact_rev_key'),
                         CAST(kv.id AS SIGNED) AS theid,
                         kv.name AS thename,
                         kv.created,
@@ -995,12 +1034,16 @@ impl Backend for MysqlBackend {
                         kv.lease,
                         kv.value,
                         kv.old_value
-                    FROM kine AS kv
+                    FROM {} AS kv
                     WHERE kv.name LIKE ? ESCAPE '^' AND kv.id > ?
                     AND (kv.value IS NULL OR kv.value != ?)
-                    ORDER BY kv.id ASC";
+                    ORDER BY kv.id ASC",
+                    kine_table_name,
+                    kine_table_name,
+                    kine_table_name
+                );
 
-                if let Ok(rows) = sqlx::query(sql)
+                if let Ok(rows) = sqlx::query(&sql)
                     .bind(&after_prefix)
                     .bind(start_rev)
                     .bind(INIT_DIR_MARKER)
@@ -1099,11 +1142,12 @@ impl Backend for MysqlBackend {
     }
 
     async fn db_size(&self) -> Result<i64> {
-        let row: (Option<i64>,) = sqlx::query_as(
+        let row: (Option<i64>,) = sqlx::query_as(&format!(
             "SELECT SUM(data_length + index_length)
              FROM information_schema.TABLES
-             WHERE table_schema = DATABASE() AND table_name = 'kine'",
-        )
+             WHERE table_schema = DATABASE() AND table_name = '{}'",
+            self.config.kine_table_name
+        ))
         .fetch_one(&self.pool)
         .await
         .map_err(|e| BackendError::Internal(e.to_string()))?;
@@ -1137,19 +1181,22 @@ impl Backend for MysqlBackend {
         }
 
         // MySQL compact uses INNER JOIN
-        let deleted = sqlx::query(
-            "DELETE kv FROM kine AS kv
+        let deleted = sqlx::query(&format!(
+            "DELETE kv FROM {} AS kv
              INNER JOIN (
                 SELECT kp.prev_revision AS id
-                FROM kine AS kp
+                FROM {} AS kp
                 WHERE kp.name != ? AND kp.prev_revision != 0 AND kp.id <= ?
                 UNION
                 SELECT kd.id AS id
-                FROM kine AS kd
+                FROM {} AS kd
                 WHERE kd.deleted != 0 AND kd.id <= ?
              ) AS ks
              ON kv.id = ks.id",
-        )
+            self.config.kine_table_name,
+            self.config.kine_table_name,
+            self.config.kine_table_name
+        ))
         .bind(COMPACT_REV_KEY)
         .bind(target)
         .bind(target)
@@ -1157,12 +1204,15 @@ impl Backend for MysqlBackend {
         .await
         .map_err(|e| BackendError::Internal(e.to_string()))?;
 
-        sqlx::query("UPDATE kine SET prev_revision = ? WHERE name = ?")
-            .bind(target)
-            .bind(COMPACT_REV_KEY)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| BackendError::Internal(e.to_string()))?;
+        sqlx::query(&format!(
+            "UPDATE {} SET prev_revision = ? WHERE name = ?",
+            self.config.kine_table_name
+        ))
+        .bind(target)
+        .bind(COMPACT_REV_KEY)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| BackendError::Internal(e.to_string()))?;
 
         debug!(
             "manual compact: deleted {} rows up to revision {}",

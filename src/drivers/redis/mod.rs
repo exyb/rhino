@@ -42,16 +42,44 @@ const COMPACT_MIN_RETAIN: i64 = 1000;
 /// These are not real data and must be excluded from query results.
 const INIT_DIR_MARKER: &[u8] = b"init_dir";
 
-// Redis key names. The `{rhino}` hash tag ensures all keys land on the same
-// hash slot, which is required for Lua scripts to access them in Redis Cluster.
-const REV_KEY: &str = "{rhino}:rev";
-const ROW_PREFIX: &str = "{rhino}:row:";
-const LOG_KEY: &str = "{rhino}:log";
-const CURRENT_KEY: &str = "{rhino}:current";
-const KEY_REVS_PREFIX: &str = "{rhino}:key:";
-const NAMES_KEY: &str = "{rhino}:names";
-const COMPACT_REV_STORE: &str = "{rhino}:compact_rev";
-const UNIQ_PREFIX: &str = "{rhino}:uniq:";
+// Redis key names use a hash tag (e.g., `{kine}`) to ensure all keys land on the
+// same hash slot, which is required for Lua scripts to access them in Redis Cluster.
+// The prefix is derived from `config.kine_table_name`.
+fn key_prefix(table_name: &str) -> String {
+    format!("{{{table_name}}}")
+}
+
+fn rev_key(table_name: &str) -> String {
+    format!("{{{table_name}}}:rev")
+}
+
+fn row_prefix(table_name: &str) -> String {
+    format!("{{{table_name}}}:row:")
+}
+
+fn log_key(table_name: &str) -> String {
+    format!("{{{table_name}}}:log")
+}
+
+fn current_key(table_name: &str) -> String {
+    format!("{{{table_name}}}:current")
+}
+
+fn key_revs_prefix(table_name: &str) -> String {
+    format!("{{{table_name}}}:key:")
+}
+
+fn names_key(table_name: &str) -> String {
+    format!("{{{table_name}}}:names")
+}
+
+fn compact_rev_store(table_name: &str) -> String {
+    format!("{{{table_name}}}:compact_rev")
+}
+
+fn uniq_prefix(table_name: &str) -> String {
+    format!("{{{table_name}}}:uniq:")
+}
 
 /// Kine-style broadcaster: fans out events to per-subscriber channels.
 /// Slow subscribers are disconnected (channel dropped) rather than lagging.
@@ -101,6 +129,8 @@ pub struct RedisConfig {
     pub compact_min_retain: i64,
     /// Max revisions to compact per batch.
     pub compact_batch_size: i64,
+    /// Name of the kine table. Defaults to `"kine"`.
+    pub kine_table_name: String,
 }
 
 impl Default for RedisConfig {
@@ -110,6 +140,7 @@ impl Default for RedisConfig {
             compact_interval: COMPACT_INTERVAL,
             compact_min_retain: COMPACT_MIN_RETAIN,
             compact_batch_size: 1000,
+            kine_table_name: "kine".to_string(),
         }
     }
 }
@@ -125,14 +156,27 @@ struct Scripts {
 }
 
 impl Scripts {
-    fn new() -> Self {
+    fn new(table_name: &str) -> Self {
+        let prefix = key_prefix(table_name);
         Self {
-            create: Script::new(Self::CREATE_LUA),
-            update: Script::new(Self::UPDATE_LUA),
-            delete: Script::new(Self::DELETE_LUA),
-            delete_prefix: Script::new(Self::DELETE_PREFIX_LUA),
-            fill: Script::new(Self::FILL_LUA),
-            historical_revs: Script::new(Self::HISTORICAL_REVS_LUA),
+            create: Script::new(
+                &Self::CREATE_LUA.replace("{rhino}", &prefix),
+            ),
+            update: Script::new(
+                &Self::UPDATE_LUA.replace("{rhino}", &prefix),
+            ),
+            delete: Script::new(
+                &Self::DELETE_LUA.replace("{rhino}", &prefix),
+            ),
+            delete_prefix: Script::new(
+                &Self::DELETE_PREFIX_LUA.replace("{rhino}", &prefix),
+            ),
+            fill: Script::new(
+                &Self::FILL_LUA.replace("{rhino}", &prefix),
+            ),
+            historical_revs: Script::new(
+                &Self::HISTORICAL_REVS_LUA.replace("{rhino}", &prefix),
+            ),
         }
     }
 
@@ -496,6 +540,21 @@ impl Scripts {
     "#;
 }
 
+/// Validate a table name to prevent SQL injection via identifier interpolation.
+fn validate_table_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(BackendError::Internal(format!(
+            "invalid table name '{}': only alphanumeric and underscore allowed",
+            name
+        )));
+    }
+    Ok(())
+}
+
 /// Redis-backed implementation of the rhino [`Backend`] trait.
 pub struct RedisBackend {
     conn: ConnectionManager,
@@ -511,6 +570,8 @@ pub struct RedisBackend {
 impl RedisBackend {
     /// Create a new Redis backend with the given configuration.
     pub async fn new(config: RedisConfig) -> std::result::Result<Self, BackendError> {
+        validate_table_name(&config.kine_table_name)?;
+
         let client = Client::open(config.dsn.as_str())
             .map_err(|e| BackendError::Internal(format!("invalid redis URL: {e}")))?;
 
@@ -527,7 +588,7 @@ impl RedisBackend {
             broadcaster: Arc::new(Broadcaster::new()),
             polled_rev: Arc::new(polled_rev_tx),
             started: Arc::new(AtomicBool::new(false)),
-            scripts: Arc::new(Scripts::new()),
+            scripts: Arc::new(Scripts::new(&config.kine_table_name)),
             config,
         })
     }
@@ -536,11 +597,12 @@ impl RedisBackend {
     async fn fill(&self, revision: i64) -> Result<()> {
         let name = format!("gap-{revision}");
         let mut conn = self.conn.clone();
+        let tn = &self.config.kine_table_name;
         let _: i64 = self
             .scripts
             .fill
-            .key(LOG_KEY)
-            .key(REV_KEY)
+            .key(log_key(tn))
+            .key(rev_key(tn))
             .arg(revision)
             .arg(&name)
             .invoke_async(&mut conn)
@@ -553,7 +615,7 @@ impl RedisBackend {
     async fn db_current_revision(&self) -> Result<i64> {
         let mut conn = self.conn.clone();
         let rev: Option<i64> = conn
-            .get(REV_KEY)
+            .get(rev_key(&self.config.kine_table_name))
             .await
             .map_err(|e| BackendError::Internal(e.to_string()))?;
         Ok(rev.unwrap_or(0))
@@ -563,7 +625,7 @@ impl RedisBackend {
     async fn get_compact_revision(&self) -> Result<i64> {
         let mut conn = self.conn.clone();
         let rev: Option<i64> = conn
-            .get(COMPACT_REV_STORE)
+            .get(compact_rev_store(&self.config.kine_table_name))
             .await
             .map_err(|e| BackendError::Internal(e.to_string()))?;
         Ok(rev.unwrap_or(0))
@@ -572,7 +634,7 @@ impl RedisBackend {
     /// Fetch a single row by revision id.
     async fn get_row(&self, id: i64) -> Result<Option<RowData>> {
         let mut conn = self.conn.clone();
-        let row_key = format!("{ROW_PREFIX}{id}");
+        let row_key = format!("{}{id}", row_prefix(&self.config.kine_table_name));
 
         let data: redis::Value = redis::cmd("HGETALL")
             .arg(&row_key)
@@ -664,8 +726,9 @@ impl RedisBackend {
         let mut conn = self.conn.clone();
         let mut pipe = redis::pipe();
 
+        let rp = row_prefix(&self.config.kine_table_name);
         for id in ids {
-            pipe.cmd("HGETALL").arg(format!("{ROW_PREFIX}{id}"));
+            pipe.cmd("HGETALL").arg(format!("{rp}{id}"));
         }
 
         let results: Vec<redis::Value> = pipe
@@ -768,7 +831,7 @@ impl RedisBackend {
 
         let target_rev = if revision == 0 {
             let rev: Option<i64> = conn
-                .hget(CURRENT_KEY, key)
+                .hget(current_key(&self.config.kine_table_name), key)
                 .await
                 .map_err(|e| BackendError::Internal(e.to_string()))?;
             match rev {
@@ -776,7 +839,7 @@ impl RedisBackend {
                 None => return Ok((current_rev, None)),
             }
         } else {
-            let key_revs = format!("{KEY_REVS_PREFIX}{key}");
+            let key_revs = format!("{}{key}", key_revs_prefix(&self.config.kine_table_name));
             let revs: Vec<i64> = redis::cmd("ZRANGEBYSCORE")
                 .arg(&key_revs)
                 .arg("-inf")
@@ -833,7 +896,7 @@ impl RedisBackend {
         let range_max = Self::prefix_range_max(prefix);
 
         let names: Vec<String> = redis::cmd("ZRANGEBYLEX")
-            .arg(NAMES_KEY)
+            .arg(names_key(&self.config.kine_table_name))
             .arg(&range_min)
             .arg(&range_max)
             .query_async(&mut conn)
@@ -853,7 +916,7 @@ impl RedisBackend {
         let target_revs: Vec<(String, i64)> = if revision == 0 {
             let mut pipe = redis::pipe();
             for name in &filtered_names {
-                pipe.cmd("HGET").arg(CURRENT_KEY).arg(name.as_str());
+                pipe.cmd("HGET").arg(current_key(&self.config.kine_table_name)).arg(name.as_str());
             }
             let revs: Vec<Option<i64>> = pipe
                 .query_async(&mut conn)
@@ -867,9 +930,10 @@ impl RedisBackend {
                 .collect()
         } else {
             let mut invocation = self.scripts.historical_revs.prepare_invoke();
+            let krp = key_revs_prefix(&self.config.kine_table_name);
             for name in &filtered_names {
                 invocation
-                    .arg(format!("{KEY_REVS_PREFIX}{name}"))
+                    .arg(format!("{krp}{name}"))
                     .arg(revision);
             }
             let revs: Vec<i64> = invocation
@@ -920,7 +984,9 @@ impl RedisBackend {
         let mut conn = self.conn.clone();
 
         let mut cmd = redis::cmd("ZRANGEBYSCORE");
-        cmd.arg(LOG_KEY).arg(format!("({revision}")).arg("+inf");
+        cmd.arg(log_key(&self.config.kine_table_name))
+            .arg(format!("({revision}"))
+            .arg("+inf");
         if limit > 0 {
             cmd.arg("LIMIT").arg(0).arg(limit);
         }
@@ -1106,7 +1172,7 @@ impl RedisBackend {
         // Parse the raw HGETALL ourselves to extract (name, rev_id) pairs,
         // then use get_rows_pipelined (which handles RESP2/RESP3 via parse_row_data).
         let mut conn = self.conn.clone();
-        let pairs = Self::parse_string_i64_hash(&mut conn, CURRENT_KEY).await;
+        let pairs = Self::parse_string_i64_hash(&mut conn, &current_key(&self.config.kine_table_name)).await;
 
         let now = Instant::now();
         let rev_ids: Vec<i64> = pairs.iter().map(|(_, r)| *r).collect();
@@ -1303,7 +1369,7 @@ impl RedisBackend {
             };
 
             let rev_ids: Vec<i64> = redis::cmd("ZRANGEBYSCORE")
-                .arg(LOG_KEY)
+                .arg(log_key(&self.config.kine_table_name))
                 .arg(&batch_min)
                 .arg(target)
                 .arg("LIMIT")
@@ -1340,7 +1406,7 @@ impl RedisBackend {
             if !candidates.is_empty() {
                 let mut pipe = redis::pipe();
                 for (_, row) in &candidates {
-                    pipe.cmd("HGET").arg(CURRENT_KEY).arg(&row.name);
+                    pipe.cmd("HGET").arg(current_key(&self.config.kine_table_name)).arg(&row.name);
                 }
                 let current_revs: Vec<Option<i64>> = pipe
                     .query_async(&mut conn)
@@ -1361,15 +1427,20 @@ impl RedisBackend {
             if !to_delete.is_empty() {
                 let mut pipe = redis::pipe();
 
+                let tn = &self.config.kine_table_name;
+                let rp = row_prefix(tn);
+                let lk = log_key(tn);
+                let krp = key_revs_prefix(tn);
+                let up = uniq_prefix(tn);
                 for (id, row) in &to_delete {
-                    pipe.cmd("DEL").arg(format!("{ROW_PREFIX}{id}"));
-                    pipe.cmd("ZREM").arg(LOG_KEY).arg(id.to_string());
+                    pipe.cmd("DEL").arg(format!("{rp}{id}"));
+                    pipe.cmd("ZREM").arg(&lk).arg(id.to_string());
                     pipe.cmd("ZREM")
-                        .arg(format!("{KEY_REVS_PREFIX}{}", row.name))
+                        .arg(format!("{krp}{}", row.name))
                         .arg(id.to_string());
                     // Clean up unique constraint key for ALL rows, including prev_revision=0
                     pipe.cmd("DEL")
-                        .arg(format!("{UNIQ_PREFIX}{}:{}", row.name, row.prev_revision));
+                        .arg(format!("{up}{}:{}", row.name, row.prev_revision));
                 }
 
                 let _: Vec<redis::Value> = pipe
@@ -1389,10 +1460,11 @@ impl RedisBackend {
 
                 if !names_to_check.is_empty() {
                     let mut check_pipe = redis::pipe();
+                    let krp = key_revs_prefix(&self.config.kine_table_name);
                     for name in &names_to_check {
                         check_pipe
                             .cmd("ZCARD")
-                            .arg(format!("{KEY_REVS_PREFIX}{name}"));
+                            .arg(format!("{krp}{name}"));
                     }
                     let counts: Vec<i64> = check_pipe
                         .query_async(&mut conn)
@@ -1403,11 +1475,12 @@ impl RedisBackend {
                     let mut has_cleanup = false;
                     for (name, count) in names_to_check.iter().zip(counts) {
                         if count == 0 {
-                            cleanup_pipe.cmd("HDEL").arg(CURRENT_KEY).arg(name);
-                            cleanup_pipe.cmd("ZREM").arg(NAMES_KEY).arg(name);
-                            cleanup_pipe
-                                .cmd("DEL")
-                                .arg(format!("{KEY_REVS_PREFIX}{name}"));
+                            let ck = current_key(&self.config.kine_table_name);
+                            let nk = names_key(&self.config.kine_table_name);
+                            let krp = key_revs_prefix(&self.config.kine_table_name);
+                            cleanup_pipe.cmd("HDEL").arg(&ck).arg(name);
+                            cleanup_pipe.cmd("ZREM").arg(&nk).arg(name);
+                            cleanup_pipe.cmd("DEL").arg(format!("{krp}{name}"));
                             has_cleanup = true;
                         }
                     }
@@ -1429,7 +1502,7 @@ impl RedisBackend {
 
         // Update compact revision
         let _: () = conn
-            .set(COMPACT_REV_STORE, target)
+            .set(compact_rev_store(&self.config.kine_table_name), target)
             .await
             .map_err(|e| BackendError::Internal(e.to_string()))?;
 
@@ -1491,10 +1564,10 @@ impl Backend for RedisBackend {
         let id: i64 = self
             .scripts
             .create
-            .key(REV_KEY)
-            .key(LOG_KEY)
-            .key(CURRENT_KEY)
-            .key(NAMES_KEY)
+            .key(rev_key(&self.config.kine_table_name))
+            .key(log_key(&self.config.kine_table_name))
+            .key(current_key(&self.config.kine_table_name))
+            .key(names_key(&self.config.kine_table_name))
             .arg(key)
             .arg(lease)
             .arg(value)
@@ -1520,10 +1593,10 @@ impl Backend for RedisBackend {
         let result: Vec<redis::Value> = self
             .scripts
             .delete
-            .key(REV_KEY)
-            .key(LOG_KEY)
-            .key(CURRENT_KEY)
-            .key(NAMES_KEY)
+            .key(rev_key(&self.config.kine_table_name))
+            .key(log_key(&self.config.kine_table_name))
+            .key(current_key(&self.config.kine_table_name))
+            .key(names_key(&self.config.kine_table_name))
             .arg(key)
             .arg(revision)
             .invoke_async(&mut conn)
@@ -1585,10 +1658,10 @@ impl Backend for RedisBackend {
         let result: Vec<redis::Value> = self
             .scripts
             .delete_prefix
-            .key(REV_KEY)
-            .key(LOG_KEY)
-            .key(CURRENT_KEY)
-            .key(NAMES_KEY)
+            .key(rev_key(&self.config.kine_table_name))
+            .key(log_key(&self.config.kine_table_name))
+            .key(current_key(&self.config.kine_table_name))
+            .key(names_key(&self.config.kine_table_name))
             .arg(&range_min)
             .arg(&range_max)
             .invoke_async(&mut conn)
@@ -1686,10 +1759,10 @@ impl Backend for RedisBackend {
         let result: Vec<redis::Value> = self
             .scripts
             .update
-            .key(REV_KEY)
-            .key(LOG_KEY)
-            .key(CURRENT_KEY)
-            .key(NAMES_KEY)
+            .key(rev_key(&self.config.kine_table_name))
+            .key(log_key(&self.config.kine_table_name))
+            .key(current_key(&self.config.kine_table_name))
+            .key(names_key(&self.config.kine_table_name))
             .arg(key)
             .arg(revision)
             .arg(lease)

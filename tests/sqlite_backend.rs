@@ -625,13 +625,13 @@ async fn test_compact_does_not_delete_live_keys() {
 }
 
 #[tokio::test]
-async fn test_compact_removes_deleted_keys_from_kine_current() {
+async fn test_compact_removes_deleted_keys() {
     let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("compact_current.db");
+    let db_path = dir.path().join("compact_deleted.db");
     let dsn = db_path.to_string_lossy().to_string();
 
     let config = SqliteConfig {
-        dsn: dsn.clone(),
+        dsn,
         compact_interval: Duration::ZERO,
         compact_min_retain: 2,
         compact_batch_size: 1000,
@@ -659,29 +659,29 @@ async fn test_compact_removes_deleted_keys_from_kine_current() {
     let (_, kvs) = backend.list("/del/", "", 0, 0, false).await.unwrap();
     assert_eq!(kvs.len(), 0, "deleted key should not appear in list");
 
-    // Verify kine_current was cleaned up.
+    // Verify the deleted key's rows were actually removed from the main table.
     let pool = sqlx::sqlite::SqlitePool::connect(&format!("sqlite:{dsn}"))
         .await
         .unwrap();
-    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM kine_current WHERE name = '/del/key'")
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM kine WHERE name = '/del/key'")
         .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!(
         row.0, 0,
-        "kine_current should not have entry for deleted+compacted key"
+        "main table should not have rows for deleted+compacted key"
     );
     pool.close().await;
 }
 
 // ---------------------------------------------------------------------------
-// kine_current consistency tests
+// Single-table consistency tests
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_kine_current_stays_consistent() {
+async fn test_single_table_stays_consistent() {
     let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("kine_current_consistency.db");
+    let db_path = dir.path().join("single_table_consistency.db");
     let dsn = db_path.to_string_lossy().to_string();
 
     let config = SqliteConfig {
@@ -717,7 +717,7 @@ async fn test_kine_current_stays_consistent() {
 
 #[tokio::test]
 async fn test_list_returns_results_immediately_after_create() {
-    // Verify kine_current is updated synchronously: a list immediately
+    // Verify the main table is updated synchronously: a list immediately
     // after create must return the key.
     let (backend, _dir) = test_backend().await;
 

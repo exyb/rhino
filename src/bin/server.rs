@@ -39,6 +39,10 @@ struct Args {
     /// Emulated etcd version string returned by the Status RPC
     #[arg(long, default_value = "3.5.13")]
     emulated_etcd_version: String,
+
+    /// Override the kine table name (env: RHINO_KINE_TABLE_NAME)
+    #[arg(long, env = "RHINO_KINE_TABLE_NAME", default_value = "kine")]
+    kine_table_name: String,
 }
 
 #[tokio::main]
@@ -60,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             compact_interval,
             compact_min_retain: args.compact_retention,
             max_connections: args.max_connections,
+            kine_table_name: args.kine_table_name.clone(),
             ..Default::default()
         };
         let backend = PostgresBackend::new(config).await?;
@@ -73,6 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             dsn: args.endpoint,
             compact_interval,
             compact_min_retain: args.compact_retention,
+            kine_table_name: args.kine_table_name.clone(),
             ..Default::default()
         };
         let backend = RedisBackend::new(config).await?;
@@ -87,6 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             compact_interval,
             compact_min_retain: args.compact_retention,
             max_connections: args.max_connections,
+            kine_table_name: args.kine_table_name.clone(),
             ..Default::default()
         };
         let backend = MysqlBackend::new(config).await?;
@@ -101,6 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             compact_interval,
             compact_min_retain: args.compact_retention,
             max_connections: args.max_connections,
+            kine_table_name: args.kine_table_name.clone(),
             ..Default::default()
         };
         let backend = SqliteBackend::new(config).await?;

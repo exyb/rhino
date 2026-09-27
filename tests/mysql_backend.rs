@@ -31,7 +31,7 @@ async fn test_backend() -> Option<MysqlBackend> {
 
     // Truncate for test isolation
     let pool = sqlx::mysql::MySqlPool::connect(&dsn).await.unwrap();
-    sqlx::query("TRUNCATE TABLE kine")
+    sqlx::query("TRUNCATE TABLE kine") // default table name
         .execute(&pool)
         .await
         .unwrap();
@@ -355,7 +355,7 @@ async fn test_compact_removes_old_rows() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let pool = sqlx::mysql::MySqlPool::connect(&dsn).await.unwrap();
-    sqlx::query("TRUNCATE TABLE kine")
+    sqlx::query("TRUNCATE TABLE kine") // default table name
         .execute(&pool)
         .await
         .unwrap();
@@ -383,7 +383,7 @@ async fn test_compact_removes_old_rows() {
         rev = new_rev;
     }
 
-    let before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM kine")
+    let before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM kine") // default table name
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -391,7 +391,7 @@ async fn test_compact_removes_old_rows() {
     let current = backend.current_revision().await.unwrap();
     backend.compact(current).await.unwrap();
 
-    let after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM kine")
+    let after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM kine") // default table name
         .fetch_one(&pool)
         .await
         .unwrap();

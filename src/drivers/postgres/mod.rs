@@ -41,6 +41,8 @@ pub struct PostgresConfig {
     pub compact_batch_size: i64,
     /// Maximum number of connections in the pool.
     pub max_connections: u32,
+    /// Name of the kine table. Defaults to `"kine"`.
+    pub kine_table_name: String,
 }
 
 impl Default for PostgresConfig {
@@ -51,6 +53,7 @@ impl Default for PostgresConfig {
             compact_min_retain: COMPACT_MIN_RETAIN,
             compact_batch_size: COMPACT_BATCH_SIZE,
             max_connections: 5,
+            kine_table_name: "kine".to_string(),
         }
     }
 }
@@ -66,9 +69,26 @@ pub struct PostgresBackend {
     config: PostgresConfig,
 }
 
+/// Validate a table name to prevent SQL injection via identifier interpolation.
+fn validate_table_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(BackendError::Internal(format!(
+            "invalid table name '{}': only alphanumeric and underscore allowed",
+            name
+        )));
+    }
+    Ok(())
+}
+
 impl PostgresBackend {
     /// Create a new PostgreSQL backend with the given configuration.
     pub async fn new(config: PostgresConfig) -> std::result::Result<Self, BackendError> {
+        validate_table_name(&config.kine_table_name)?;
+
         let opts: PgConnectOptions = config
             .dsn
             .parse()
@@ -94,8 +114,10 @@ impl PostgresBackend {
     }
 
     async fn setup_schema(&self) -> Result<()> {
+        let k = &self.config.kine_table_name;
         let statements = [
-            "CREATE TABLE IF NOT EXISTS kine (
+            format!(
+                "CREATE TABLE IF NOT EXISTS {k} (
                 id BIGSERIAL PRIMARY KEY,
                 name TEXT COLLATE \"C\" NOT NULL,
                 created INTEGER NOT NULL,
@@ -105,13 +127,18 @@ impl PostgresBackend {
                 lease INTEGER NOT NULL,
                 value BYTEA,
                 old_value BYTEA
-            )",
-            "CREATE INDEX IF NOT EXISTS kine_name_index ON kine (name)",
-            "CREATE INDEX IF NOT EXISTS kine_name_id_index ON kine (name, id)",
-            "CREATE INDEX IF NOT EXISTS kine_id_deleted_index ON kine (id, deleted)",
-            "CREATE INDEX IF NOT EXISTS kine_prev_revision_index ON kine (prev_revision)",
-            "CREATE UNIQUE INDEX IF NOT EXISTS kine_name_prev_revision_uindex ON kine (name, prev_revision)",
-            "CREATE INDEX IF NOT EXISTS kine_list_query_index ON kine (name, id DESC, deleted)",
+            )"
+            ),
+            format!("CREATE INDEX IF NOT EXISTS {k}_name_index ON {k} (name)"),
+            format!("CREATE INDEX IF NOT EXISTS {k}_name_id_index ON {k} (name, id)"),
+            format!("CREATE INDEX IF NOT EXISTS {k}_id_deleted_index ON {k} (id, deleted)"),
+            format!("CREATE INDEX IF NOT EXISTS {k}_prev_revision_index ON {k} (prev_revision)"),
+            format!(
+                "CREATE UNIQUE INDEX IF NOT EXISTS {k}_name_prev_revision_uindex ON {k} (name, prev_revision)"
+            ),
+            format!(
+                "CREATE INDEX IF NOT EXISTS {k}_list_query_index ON {k} (name, id DESC, deleted)"
+            ),
         ];
 
         for stmt in &statements {
@@ -126,11 +153,14 @@ impl PostgresBackend {
     }
 
     async fn ensure_compact_rev_key(&self) -> Result<()> {
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM kine WHERE name = $1")
-            .bind(COMPACT_REV_KEY)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| BackendError::Internal(e.to_string()))?;
+        let count: (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM {} WHERE name = $1",
+            self.config.kine_table_name
+        ))
+        .bind(COMPACT_REV_KEY)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| BackendError::Internal(e.to_string()))?;
 
         if count.0 == 0 {
             self.insert(COMPACT_REV_KEY, true, false, 0, 0, 0, b"", b"")
@@ -155,10 +185,11 @@ impl PostgresBackend {
         let c = if create { 1i32 } else { 0 };
         let d = if delete { 1i32 } else { 0 };
 
-        let row: (i64,) = sqlx::query_as(
-            "INSERT INTO kine(name, created, deleted, create_revision, prev_revision, lease, value, old_value)
+        let row: (i64,) = sqlx::query_as(&format!(
+            "INSERT INTO {}(name, created, deleted, create_revision, prev_revision, lease, value, old_value)
              VALUES($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
-        )
+            self.config.kine_table_name
+        ))
         .bind(key)
         .bind(c)
         .bind(d)
@@ -187,11 +218,13 @@ impl PostgresBackend {
     async fn fill(&self, revision: i64) -> Result<()> {
         let name = format!("gap-{revision}");
         // Use ON CONFLICT DO NOTHING (Postgres equivalent of INSERT OR IGNORE)
-        sqlx::query(
-            "INSERT INTO kine(id, name, created, deleted, create_revision, prev_revision, lease, value, old_value)
+        let kine_table = &self.config.kine_table_name;
+        sqlx::query(&format!(
+            "INSERT INTO {}(id, name, created, deleted, create_revision, prev_revision, lease, value, old_value)
              VALUES($1, $2, 0, 1, 0, 0, 0, NULL, NULL)
              ON CONFLICT DO NOTHING",
-        )
+            kine_table
+        ))
         .bind(revision)
         .bind(&name)
         .execute(&self.pool)
@@ -199,30 +232,38 @@ impl PostgresBackend {
         .map_err(|e| BackendError::Internal(e.to_string()))?;
 
         // Reset the sequence to avoid conflicts with future inserts
-        sqlx::query("SELECT setval('kine_id_seq', GREATEST(nextval('kine_id_seq'), $1))")
-            .bind(revision + 1)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| BackendError::Internal(e.to_string()))?;
+        let seq_name = format!("{}_id_seq", kine_table);
+        sqlx::query(&format!(
+            "SELECT setval('{seq_name}', GREATEST(nextval('{seq_name}'), $1))"
+        ))
+        .bind(revision + 1)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| BackendError::Internal(e.to_string()))?;
 
         Ok(())
     }
 
     async fn db_current_revision(&self) -> Result<i64> {
-        let row: (Option<i64>,) = sqlx::query_as("SELECT MAX(id) FROM kine")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| BackendError::Internal(e.to_string()))?;
+        let row: (Option<i64>,) = sqlx::query_as(&format!(
+            "SELECT MAX(id) FROM {}",
+            self.config.kine_table_name
+        ))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| BackendError::Internal(e.to_string()))?;
         Ok(row.0.unwrap_or(0))
     }
 
     async fn get_compact_revision(&self) -> Result<i64> {
-        let row: (Option<i64>,) =
-            sqlx::query_as("SELECT MAX(prev_revision) FROM kine WHERE name = $1")
-                .bind(COMPACT_REV_KEY)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| BackendError::Internal(e.to_string()))?;
+        let row: (Option<i64>,) = sqlx::query_as(&format!(
+            "SELECT MAX(prev_revision) FROM {} WHERE name = $1",
+            self.config.kine_table_name
+        ))
+        .bind(COMPACT_REV_KEY)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| BackendError::Internal(e.to_string()))?;
         Ok(row.0.unwrap_or(0))
     }
 
@@ -291,10 +332,11 @@ impl PostgresBackend {
         } else {
             String::new()
         };
+        let k = &self.config.kine_table_name;
         let sql = format!(
             "SELECT
-                (SELECT MAX(rkv.id) FROM kine AS rkv),
-                (SELECT MAX(crkv.prev_revision) FROM kine AS crkv WHERE crkv.name = '{COMPACT_REV_KEY}'),
+                (SELECT MAX(rkv.id) FROM {k} AS rkv),
+                (SELECT MAX(crkv.prev_revision) FROM {k} AS crkv WHERE crkv.name = '{COMPACT_REV_KEY}'),
                 maxkv.*
             FROM (
                 SELECT DISTINCT ON (name)
@@ -306,7 +348,7 @@ impl PostgresBackend {
                     kv.prev_revision,
                     kv.lease
                     {value_cols}
-                FROM kine AS kv
+                FROM {k} AS kv
                 WHERE kv.name LIKE $1 ESCAPE '^'
                 {extra_where}
                 {init_dir_filter}
@@ -378,10 +420,11 @@ impl PostgresBackend {
             String::new()
         };
 
+        let k = &self.config.kine_table_name;
         let sql = format!(
             "SELECT
-                (SELECT MAX(rkv.id) FROM kine AS rkv),
-                (SELECT MAX(crkv.prev_revision) FROM kine AS crkv WHERE crkv.name = '{COMPACT_REV_KEY}'),
+                (SELECT MAX(rkv.id) FROM {k} AS rkv),
+                (SELECT MAX(crkv.prev_revision) FROM {k} AS crkv WHERE crkv.name = '{COMPACT_REV_KEY}'),
                 kv.id AS theid,
                 kv.name,
                 kv.created,
@@ -391,7 +434,7 @@ impl PostgresBackend {
                 kv.lease,
                 kv.value,
                 kv.old_value
-            FROM kine AS kv
+            FROM {k} AS kv
             WHERE kv.name LIKE $1 ESCAPE '^' AND kv.id > $2
             AND (kv.value IS NULL OR kv.value != $3)
             ORDER BY kv.id ASC
@@ -633,19 +676,22 @@ impl PostgresBackend {
                 .map_err(|e| BackendError::Internal(e.to_string()))?;
 
             // PostgreSQL compact uses USING clause instead of IN subquery
-            let deleted = sqlx::query(
-                "DELETE FROM kine AS kv
+            let deleted = sqlx::query(&format!(
+                "DELETE FROM {} AS kv
                  USING (
                     SELECT kp.prev_revision AS id
-                    FROM kine AS kp
+                    FROM {} AS kp
                     WHERE kp.name != $1 AND kp.prev_revision != 0 AND kp.id <= $2
                     UNION
                     SELECT kd.id AS id
-                    FROM kine AS kd
+                    FROM {} AS kd
                     WHERE kd.deleted != 0 AND kd.id <= $3
                  ) AS ks
                  WHERE kv.id = ks.id",
-            )
+                self.config.kine_table_name,
+                self.config.kine_table_name,
+                self.config.kine_table_name
+            ))
             .bind(COMPACT_REV_KEY)
             .bind(iter_rev)
             .bind(iter_rev)
@@ -653,12 +699,15 @@ impl PostgresBackend {
             .await
             .map_err(|e| BackendError::Internal(e.to_string()))?;
 
-            sqlx::query("UPDATE kine SET prev_revision = $1 WHERE name = $2")
-                .bind(iter_rev)
-                .bind(COMPACT_REV_KEY)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| BackendError::Internal(e.to_string()))?;
+            sqlx::query(&format!(
+                "UPDATE {} SET prev_revision = $1 WHERE name = $2",
+                self.config.kine_table_name
+            ))
+            .bind(iter_rev)
+            .bind(COMPACT_REV_KEY)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| BackendError::Internal(e.to_string()))?;
 
             tx.commit()
                 .await
@@ -947,6 +996,7 @@ impl Backend for PostgresBackend {
         let prefix = key.to_string();
         let start_rev = if revision > 0 { revision - 1 } else { 0 };
         let pool = self.pool.clone();
+        let kine_table_name = self.config.kine_table_name.clone();
 
         tokio::spawn(async move {
             // Fetch historical events
@@ -957,10 +1007,10 @@ impl Backend for PostgresBackend {
                     prefix.clone()
                 };
 
-                let sql =
+                let sql = format!(
                     "SELECT
-                        (SELECT MAX(rkv.id) FROM kine AS rkv),
-                        (SELECT MAX(crkv.prev_revision) FROM kine AS crkv WHERE crkv.name = 'compact_rev_key'),
+                        (SELECT MAX(rkv.id) FROM {} AS rkv),
+                        (SELECT MAX(crkv.prev_revision) FROM {} AS crkv WHERE crkv.name = 'compact_rev_key'),
                         kv.id AS theid,
                         kv.name,
                         kv.created,
@@ -970,12 +1020,16 @@ impl Backend for PostgresBackend {
                         kv.lease,
                         kv.value,
                         kv.old_value
-                    FROM kine AS kv
+                    FROM {} AS kv
                     WHERE kv.name LIKE $1 ESCAPE '^' AND kv.id > $2
                     AND (kv.value IS NULL OR kv.value != $3)
-                    ORDER BY kv.id ASC";
+                    ORDER BY kv.id ASC",
+                    kine_table_name,
+                    kine_table_name,
+                    kine_table_name
+                );
 
-                if let Ok(rows) = sqlx::query(sql)
+                if let Ok(rows) = sqlx::query(&sql)
                     .bind(&after_prefix)
                     .bind(start_rev)
                     .bind(INIT_DIR_MARKER)
@@ -1075,10 +1129,13 @@ impl Backend for PostgresBackend {
     }
 
     async fn db_size(&self) -> Result<i64> {
-        let row: (i64,) = sqlx::query_as("SELECT pg_total_relation_size('kine')")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| BackendError::Internal(e.to_string()))?;
+        let row: (i64,) = sqlx::query_as(&format!(
+            "SELECT pg_total_relation_size('{}')",
+            self.config.kine_table_name
+        ))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| BackendError::Internal(e.to_string()))?;
         Ok(row.0)
     }
 
@@ -1109,19 +1166,22 @@ impl Backend for PostgresBackend {
         }
 
         // PostgreSQL compact uses USING clause
-        let deleted = sqlx::query(
-            "DELETE FROM kine AS kv
+        let deleted = sqlx::query(&format!(
+            "DELETE FROM {} AS kv
              USING (
                 SELECT kp.prev_revision AS id
-                FROM kine AS kp
+                FROM {} AS kp
                 WHERE kp.name != $1 AND kp.prev_revision != 0 AND kp.id <= $2
                 UNION
                 SELECT kd.id AS id
-                FROM kine AS kd
+                FROM {} AS kd
                 WHERE kd.deleted != 0 AND kd.id <= $3
              ) AS ks
              WHERE kv.id = ks.id",
-        )
+            self.config.kine_table_name,
+            self.config.kine_table_name,
+            self.config.kine_table_name
+        ))
         .bind(COMPACT_REV_KEY)
         .bind(target)
         .bind(target)
@@ -1129,12 +1189,15 @@ impl Backend for PostgresBackend {
         .await
         .map_err(|e| BackendError::Internal(e.to_string()))?;
 
-        sqlx::query("UPDATE kine SET prev_revision = $1 WHERE name = $2")
-            .bind(target)
-            .bind(COMPACT_REV_KEY)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| BackendError::Internal(e.to_string()))?;
+        sqlx::query(&format!(
+            "UPDATE {} SET prev_revision = $1 WHERE name = $2",
+            self.config.kine_table_name
+        ))
+        .bind(target)
+        .bind(COMPACT_REV_KEY)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| BackendError::Internal(e.to_string()))?;
 
         debug!(
             "manual compact: deleted {} rows up to revision {}",

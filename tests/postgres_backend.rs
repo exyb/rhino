@@ -36,7 +36,7 @@ async fn test_backend() -> Option<PostgresBackend> {
 
     // Truncate for test isolation and re-start
     let pool = sqlx::postgres::PgPool::connect(&dsn).await.unwrap();
-    sqlx::query("TRUNCATE kine RESTART IDENTITY")
+    sqlx::query("TRUNCATE kine RESTART IDENTITY") // default table name
         .execute(&pool)
         .await
         .unwrap();
@@ -361,7 +361,7 @@ async fn test_compact_removes_old_rows() {
 
     // Truncate for isolation
     let pool = sqlx::postgres::PgPool::connect(&dsn).await.unwrap();
-    sqlx::query("TRUNCATE kine RESTART IDENTITY")
+    sqlx::query("TRUNCATE kine RESTART IDENTITY") // default table name
         .execute(&pool)
         .await
         .unwrap();
@@ -390,7 +390,7 @@ async fn test_compact_removes_old_rows() {
         rev = new_rev;
     }
 
-    let before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM kine")
+    let before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM kine") // default table name
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -398,7 +398,7 @@ async fn test_compact_removes_old_rows() {
     let current = backend.current_revision().await.unwrap();
     backend.compact(current).await.unwrap();
 
-    let after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM kine")
+    let after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM kine") // default table name
         .fetch_one(&pool)
         .await
         .unwrap();
