@@ -447,12 +447,19 @@ async fn handle_watch<B: Backend>(
     // Parse the create request parameters from JSON body.
     let create_request = parse_watch_create_request(value);
 
+    // Watch the byte range [key, range_end); an empty range_end means a single
+    // key (or prefix when the key ends with '/') — see `key_in_watch_range`.
+    let watch_key = String::from_utf8_lossy(&create_request.key).to_string();
+    let watch_range_end = String::from_utf8_lossy(&create_request.range_end).to_string();
+
     // Call bridge.create_watch() which sets up the watcher and returns an event stream.
     let watch_resp = match bridge
         .create_watch(
-            &String::from_utf8_lossy(&create_request.key),
+            &watch_key,
+            &watch_range_end,
             create_request.start_revision,
             create_request.progress_notify,
+            create_request.prev_kv,
         )
         .await
     {
@@ -588,11 +595,20 @@ fn event_to_json(event: &mvccpb::Event) -> Value {
         0 => "PUT",    // event::EventType::Put
         _ => "DELETE", // event::EventType::Delete
     };
-    serde_json::json!({
-        "type": type_str,
-        "kv": event.kv.as_ref().map(kv_to_json).unwrap_or(Value::Null),
-        "prevKv": event.prev_kv.as_ref().map(kv_to_json),
-    })
+    let mut obj = serde_json::Map::new();
+    obj.insert("type".to_string(), Value::String(type_str.to_string()));
+    obj.insert(
+        "kv".to_string(),
+        event.kv.as_ref().map(kv_to_json).unwrap_or(Value::Null),
+    );
+    // snake_case matches etcd's grpc-gateway (protojson with UseProtoNames,
+    // which omits unset message fields) and what lua-resty-etcd reads
+    // (`event.prev_kv`). The server layer only populates this field when the
+    // watch was created with prev_kv=true.
+    if let Some(pk) = &event.prev_kv {
+        obj.insert("prev_kv".to_string(), kv_to_json(pk));
+    }
+    Value::Object(obj)
 }
 
 // ---------------------------------------------------------------------------
@@ -1110,8 +1126,14 @@ fn member_to_json(member: &proto::Member) -> Value {
 /// Parse a WatchCreateRequest from JSON.
 /// APISIX sends snake_case field names.
 pub(crate) fn parse_watch_create_request(value: &Value) -> proto::WatchCreateRequest {
-    // The JSON body can be either {"createRequest": {...}} or the bare create request.
-    let req = value.get("createRequest").unwrap_or(value);
+    // etcd's grpc-gateway serializes the WatchRequest oneof under the
+    // snake_case name `create_request` — this is what lua-resty-etcd/APISIX
+    // send (`{"create_request": {...}}`). Accept the camelCase spelling and a
+    // bare create request body as fallbacks.
+    let req = value
+        .get("create_request")
+        .or_else(|| value.get("createRequest"))
+        .unwrap_or(value);
 
     proto::WatchCreateRequest {
         key: bytes_from_json(req, "key"),
@@ -1131,7 +1153,7 @@ pub(crate) fn parse_watch_create_request(value: &Value) -> proto::WatchCreateReq
                     .collect()
             })
             .unwrap_or_default(),
-        prev_kv: bool_from_json(req, "prev_kv"),
+        prev_kv: bool_from_json(req, "prev_kv") || bool_from_json(req, "prevKv"),
         watch_id: i64_from_json(req, "watch_id"),
         fragment: bool_from_json(req, "fragment"),
     }
@@ -1248,4 +1270,131 @@ fn snapshot_response_to_json(resp: &proto::SnapshotResponse) -> String {
 
 // watch_response_to_json and event_to_json are defined earlier in this file.
 // Do not redefine them here to avoid duplicate definitions.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// lua-resty-etcd (and thus APISIX) sends the watcher options wrapped in a
+    /// snake_case `create_request` object. Reading the camelCase `createRequest`
+    /// key only made every field parse as empty, producing a watch on an empty
+    /// key that never delivered events.
+    #[test]
+    fn parse_watch_create_request_snake_case_wrapper() {
+        let body = serde_json::json!({
+            "create_request": {
+                "key": b64_encode(b"/apisix/"),
+                "range_end": b64_encode(b"/apisix0"),
+                "start_revision": "12",
+                "progress_notify": true,
+                "filters": ["NODELETE"],
+            }
+        });
+        let req = parse_watch_create_request(&body);
+        assert_eq!(req.key, b"/apisix/");
+        assert_eq!(req.range_end, b"/apisix0");
+        assert_eq!(req.start_revision, 12);
+        assert!(req.progress_notify);
+        assert_eq!(req.filters, vec![1]); // NODELETE
+    }
+
+    #[test]
+    fn parse_watch_create_request_camel_case_wrapper() {
+        let body = serde_json::json!({
+            "createRequest": {
+                "key": b64_encode(b"/foo"),
+                "start_revision": 3,
+            }
+        });
+        let req = parse_watch_create_request(&body);
+        assert_eq!(req.key, b"/foo");
+        assert_eq!(req.start_revision, 3);
+    }
+
+    #[test]
+    fn parse_watch_create_request_bare_body() {
+        let body = serde_json::json!({
+            "key": b64_encode(b"/bar"),
+            "range_end": b64_encode(b"/bas"),
+        });
+        let req = parse_watch_create_request(&body);
+        assert_eq!(req.key, b"/bar");
+        assert_eq!(req.range_end, b"/bas");
+    }
+
+    /// etcd's grpc-gateway emits snake_case (`prev_kv`); lua-resty-etcd reads
+    /// `event.prev_kv` when handling delete events with prev_kv enabled.
+    #[test]
+    fn event_to_json_uses_snake_case_prev_kv() {
+        let event = mvccpb::Event {
+            r#type: mvccpb::event::EventType::Delete.into(),
+            kv: Some(mvccpb::KeyValue {
+                key: b"/apisix/routes/1".to_vec(),
+                value: Vec::new(),
+                create_revision: 1,
+                mod_revision: 5,
+                version: 1,
+                lease: 0,
+            }),
+            prev_kv: Some(mvccpb::KeyValue {
+                key: b"/apisix/routes/1".to_vec(),
+                value: b"old".to_vec(),
+                create_revision: 1,
+                mod_revision: 2,
+                version: 1,
+                lease: 0,
+            }),
+        };
+        let json = event_to_json(&event);
+        assert!(json.get("prev_kv").is_some(), "prev_kv missing: {json}");
+        assert!(json.get("prevKv").is_none(), "camelCase prevKv present: {json}");
+        assert_eq!(
+            json["prev_kv"]["value"],
+            Value::String(b64_encode(b"old"))
+        );
+    }
+
+    /// Guard: mirroring etcd's grpc-gateway (protojson), the `prev_kv` field is
+    /// omitted entirely when the watch did not request it — otherwise events
+    /// carry a redundant copy of the previous value.
+    #[test]
+    fn event_to_json_omits_prev_kv_when_absent() {
+        let event = mvccpb::Event {
+            r#type: mvccpb::event::EventType::Put.into(),
+            kv: Some(mvccpb::KeyValue {
+                key: b"/apisix/routes/1".to_vec(),
+                value: b"new".to_vec(),
+                create_revision: 1,
+                mod_revision: 5,
+                version: 1,
+                lease: 0,
+            }),
+            prev_kv: None,
+        };
+        let json = event_to_json(&event);
+        assert!(json.get("prev_kv").is_none(), "prev_kv must be omitted: {json}");
+        assert!(json.get("prevKv").is_none(), "camelCase prevKv present: {json}");
+    }
+
+    /// Guard: the snake_case `prev_kv` flag from REST watch requests must reach
+    /// the WatchCreateRequest (camelCase accepted as a fallback).
+    #[test]
+    fn parse_watch_create_request_reads_prev_kv_flag() {
+        let body: Value = serde_json::from_str(
+            r#"{"create_request": {"key": "L2Zvbw==", "prev_kv": true}}"#,
+        )
+        .unwrap();
+        assert!(parse_watch_create_request(&body).prev_kv);
+
+        let body: Value = serde_json::from_str(
+            r#"{"create_request": {"key": "L2Zvbw==", "prevKv": true}}"#,
+        )
+        .unwrap();
+        assert!(parse_watch_create_request(&body).prev_kv);
+
+        let body: Value =
+            serde_json::from_str(r#"{"create_request": {"key": "L2Zvbw=="}}"#).unwrap();
+        assert!(!parse_watch_create_request(&body).prev_kv);
+    }
+}
 

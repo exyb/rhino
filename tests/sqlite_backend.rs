@@ -216,7 +216,7 @@ async fn test_backend_watch() {
     let (_, _, _) = b.update("/test/a/1", &[], rev2, 0).await.unwrap();
 
     // Watch from base_rev+1 — should see all 5 events.
-    let wr = b.watch("/", base_rev + 1).await.unwrap();
+    let wr = b.watch("/", "", base_rev + 1).await.unwrap();
     let mut events_rx = wr.events;
 
     let mut all_events = Vec::new();
@@ -235,7 +235,7 @@ async fn test_backend_watch() {
     );
 
     // Watch with prefix — only /test/a/1 events (create + update = 2).
-    let wr = b.watch("/test/a/", base_rev + 1).await.unwrap();
+    let wr = b.watch("/test/a/", "", base_rev + 1).await.unwrap();
     let mut events_rx = wr.events;
 
     let mut prefix_events = Vec::new();
@@ -344,7 +344,7 @@ async fn test_watch_live_events() {
 
     let current_rev = backend.current_revision().await.unwrap();
 
-    let watch_result = backend.watch("/watch/", current_rev + 1).await.unwrap();
+    let watch_result = backend.watch("/watch/", "", current_rev + 1).await.unwrap();
     let mut events_rx = watch_result.events;
 
     // Create a key that matches the watch prefix.
@@ -368,7 +368,7 @@ async fn test_watch_event_version_marks_create_vs_update() {
     let (backend, _dir) = test_backend().await;
 
     let current_rev = backend.current_revision().await.unwrap();
-    let watch_result = backend.watch("/ver/", current_rev + 1).await.unwrap();
+    let watch_result = backend.watch("/ver/", "", current_rev + 1).await.unwrap();
     let mut rx = watch_result.events;
 
     let rev = backend.create("/ver/k", b"v1", 0).await.unwrap();
@@ -410,7 +410,7 @@ async fn test_watch_sees_updates_and_deletes() {
     let rev = backend.create("/wd/k", b"v1", 0).await.unwrap();
     let current_rev = backend.current_revision().await.unwrap();
 
-    let watch_result = backend.watch("/wd/", current_rev + 1).await.unwrap();
+    let watch_result = backend.watch("/wd/", "", current_rev + 1).await.unwrap();
     let mut rx = watch_result.events;
 
     // Update the key.
@@ -440,6 +440,58 @@ async fn test_watch_sees_updates_and_deletes() {
     let has_delete = all_events.iter().any(|e| e.delete);
     assert!(has_update, "should have an update event with value v2");
     assert!(has_delete, "should have a delete event");
+}
+
+/// Watches with a non-empty `range_end` must honor etcd's `[key, range_end)`
+/// byte semantics. This is how APISIX's lua-resty-etcd `watchdir("/apisix/")`
+/// (range_end "/apisix0") and `etcdctl watch --prefix /pre` (range_end "/prf")
+/// subscribe to changes — dropping range_end silently delivered nothing.
+#[tokio::test]
+async fn test_watch_range_end_filters_events() {
+    let (backend, _dir) = test_backend().await;
+
+    let current_rev = backend.current_revision().await.unwrap();
+
+    // Prefix range: ["/pre", "/prf").
+    let watch_result = backend
+        .watch("/pre", "/prf", current_rev + 1)
+        .await
+        .unwrap();
+    let mut rx = watch_result.events;
+
+    // In range: "/prefix/a" and "/prelude".
+    backend.create("/prefix/a", b"1", 0).await.unwrap();
+    backend.create("/prelude", b"2", 0).await.unwrap();
+    // Out of range: "/prf" is the exclusive upper bound, "/pr" is below start.
+    backend.create("/prf", b"3", 0).await.unwrap();
+    backend.create("/pr", b"4", 0).await.unwrap();
+
+    let mut all = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while all.len() < 2 && tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(1500), rx.recv()).await {
+            Ok(Some(batch)) => all.extend(batch),
+            _ => break,
+        }
+    }
+
+    let keys: Vec<&str> = all.iter().map(|e| e.kv.key.as_str()).collect();
+    assert!(
+        keys.contains(&"/prefix/a"),
+        "missing in-range event: {keys:?}"
+    );
+    assert!(
+        keys.contains(&"/prelude"),
+        "missing in-range event: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"/prf"),
+        "upper bound must be exclusive: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"/pr"),
+        "below-start key must be filtered: {keys:?}"
+    );
 }
 
 #[tokio::test]
@@ -631,7 +683,7 @@ async fn test_compact_removes_deleted_keys() {
     let dsn = db_path.to_string_lossy().to_string();
 
     let config = SqliteConfig {
-        dsn,
+        dsn: dsn.clone(),
         compact_interval: Duration::ZERO,
         compact_min_retain: 2,
         compact_batch_size: 1000,
@@ -860,7 +912,7 @@ async fn test_watch_compacted_revision_error() {
     backend.compact(current).await.unwrap();
 
     // Watch at a compacted revision should return error.
-    let result = backend.watch("/wc/", 1).await;
+    let result = backend.watch("/wc/", "", 1).await;
     assert!(
         matches!(result, Err(BackendError::Compacted)),
         "watching at compacted revision should return Compacted error"

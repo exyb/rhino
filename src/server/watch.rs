@@ -9,7 +9,7 @@ use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{error, trace};
 
-use crate::backend::{Backend, BackendError};
+use crate::backend::{Backend, BackendError, Event};
 use crate::proto::etcdserverpb::watch_server::Watch;
 use crate::proto::etcdserverpb::*;
 use crate::proto::mvccpb;
@@ -30,6 +30,43 @@ fn backend_err_to_status(e: BackendError) -> Status {
     match e {
         BackendError::Compacted => Status::out_of_range(e.to_string()),
         _ => Status::internal(e.to_string()),
+    }
+}
+
+/// Map a backend event to the proto event sent to clients.
+///
+/// `prev_kv` is only attached when the watch was created with the `prev_kv`
+/// option — matching etcd (and etcdctl, which prints the previous value only
+/// for `--prev-kv` watches). Backends always carry the previous value, so the
+/// stripping happens here at the protocol boundary.
+pub(crate) fn event_to_proto(e: &Event, want_prev_kv: bool) -> mvccpb::Event {
+    let event_type = if e.delete {
+        mvccpb::event::EventType::Delete
+    } else {
+        mvccpb::event::EventType::Put
+    };
+    mvccpb::Event {
+        r#type: event_type.into(),
+        kv: Some(mvccpb::KeyValue {
+            key: e.kv.key.as_bytes().to_vec(),
+            value: e.kv.value.clone(),
+            create_revision: e.kv.create_revision,
+            mod_revision: e.kv.mod_revision,
+            version: e.kv.version,
+            lease: e.kv.lease,
+        }),
+        prev_kv: if want_prev_kv {
+            e.prev_kv.as_ref().map(|pk| mvccpb::KeyValue {
+                key: pk.key.as_bytes().to_vec(),
+                value: pk.value.clone(),
+                create_revision: pk.create_revision,
+                mod_revision: pk.mod_revision,
+                version: pk.version,
+                lease: pk.lease,
+            })
+        } else {
+            None
+        },
     }
 }
 
@@ -216,11 +253,12 @@ impl<B: Backend> Watch for KvBridge<B> {
                 match req.request_union {
                     Some(watch_request::RequestUnion::CreateRequest(create)) => {
                         tracing::info!(
-                            "WATCH create_request: key={:?}, range_end={:?}, start_revision={}, progress_notify={}, watch_id={}",
+                            "WATCH create_request: key={:?}, range_end={:?}, start_revision={}, progress_notify={}, prev_kv={}, watch_id={}",
                             String::from_utf8_lossy(&create.key),
                             String::from_utf8_lossy(&create.range_end),
                             create.start_revision,
                             create.progress_notify,
+                            create.prev_kv,
                             create.watch_id,
                         );
 
@@ -251,7 +289,11 @@ impl<B: Backend> Watch for KvBridge<B> {
                         } else {
                             raw_key
                         };
+                        // Watch the byte range [key, range_end); see
+                        // `key_in_watch_range` for the exact semantics.
+                        let range_end = String::from_utf8_lossy(&create.range_end).to_string();
                         let start_revision = create.start_revision;
+                        let want_prev_kv = create.prev_kv;
 
                         // Reject negative start revision (kine sends ErrCompacted)
                         if start_revision < 0 {
@@ -297,7 +339,7 @@ impl<B: Backend> Watch for KvBridge<B> {
                         let resp_tx = resp_tx.clone();
                         tokio::spawn(async move {
                             tracing::info!("WATCH task started: watch_id={}, key={}, start_revision={}", watch_id, key, start_revision);
-                            let watch_result = match backend.watch(&key, start_revision).await {
+                            let watch_result = match backend.watch(&key, &range_end, start_revision).await {
                                 Ok(wr) => {
                                     // Only cancel if the requested start_revision falls
                                     // below the compaction watermark (the backend already
@@ -370,32 +412,7 @@ impl<B: Backend> Watch for KvBridge<B> {
 
                                         let proto_events: Vec<mvccpb::Event> = events
                                             .iter()
-                                            .map(|e| {
-                                                let event_type = if e.delete {
-                                                    mvccpb::event::EventType::Delete
-                                                } else {
-                                                    mvccpb::event::EventType::Put
-                                                };
-                                                mvccpb::Event {
-                                                    r#type: event_type.into(),
-                                                    kv: Some(mvccpb::KeyValue {
-                                                        key: e.kv.key.as_bytes().to_vec(),
-                                                        value: e.kv.value.clone(),
-                                                        create_revision: e.kv.create_revision,
-                                                        mod_revision: e.kv.mod_revision,
-                                                        version: e.kv.version,
-                                                        lease: e.kv.lease,
-                                                    }),
-                                                    prev_kv: e.prev_kv.as_ref().map(|pk| mvccpb::KeyValue {
-                                                        key: pk.key.as_bytes().to_vec(),
-                                                        value: pk.value.clone(),
-                                                        create_revision: pk.create_revision,
-                                                        mod_revision: pk.mod_revision,
-                                                        version: pk.version,
-                                                        lease: pk.lease,
-                                                    }),
-                                                }
-                                            })
+                                            .map(|e| event_to_proto(e, want_prev_kv))
                                             .collect();
 
                                         let last_rev = events
@@ -501,5 +518,63 @@ impl<B: Backend> Watch for KvBridge<B> {
         // Convert the mpsc receiver into a stream for tonic
         let output = tokio_stream::wrappers::ReceiverStream::new(resp_rx);
         Ok(Response::new(Box::pin(output) as Self::WatchStream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::KeyValue;
+
+    fn event_with_prev(prev: Option<KeyValue>) -> Event {
+        Event {
+            create: false,
+            delete: false,
+            kv: KeyValue {
+                key: "/apisix/routes/x".to_string(),
+                value: b"new".to_vec(),
+                version: 0,
+                create_revision: 10,
+                mod_revision: 20,
+                lease: 0,
+            },
+            prev_kv: prev,
+        }
+    }
+
+    fn old_kv() -> KeyValue {
+        KeyValue {
+            key: "/apisix/routes/x".to_string(),
+            value: b"old".to_vec(),
+            version: 0,
+            create_revision: 10,
+            mod_revision: 12,
+            lease: 0,
+        }
+    }
+
+    /// Guard: the previous value is only attached when the watch was created
+    /// with `prev_kv=true` (etcd semantics). Otherwise etcdctl prints the old
+    /// value alongside the new one for plain watches, which users read as a
+    /// duplicated/redundant event.
+    #[test]
+    fn event_to_proto_omits_prev_kv_unless_requested() {
+        let e = event_with_prev(Some(old_kv()));
+
+        let p = event_to_proto(&e, false);
+        assert!(p.prev_kv.is_none(), "prev_kv must be stripped when not requested");
+        assert_eq!(p.kv.as_ref().unwrap().value, b"new");
+
+        let p = event_to_proto(&e, true);
+        let pk = p.prev_kv.as_ref().expect("prev_kv must be attached when requested");
+        assert_eq!(pk.value, b"old");
+        assert_eq!(pk.mod_revision, 12);
+    }
+
+    #[test]
+    fn event_to_proto_without_prev_value_stays_none() {
+        let e = event_with_prev(None);
+        assert!(event_to_proto(&e, true).prev_kv.is_none());
+        assert!(event_to_proto(&e, false).prev_kv.is_none());
     }
 }

@@ -228,8 +228,10 @@ impl<B: Backend> KvBridge<B> {
     pub async fn create_watch(
         &self,
         key: &str,
+        range_end: &str,
         start_revision: i64,
         progress_notify: bool,
+        prev_kv: bool,
     ) -> Result<tonic::Response<crate::server::watch::WatchResponseStream>, tonic::Status> {
         use crate::proto::etcdserverpb::*;
         use tokio::sync::mpsc;
@@ -312,8 +314,13 @@ impl<B: Backend> KvBridge<B> {
         // Spawn the actual watch task (delegates to backend.watch + streams events).
         let resp_tx_clone = resp_tx.clone();
         let watch_key = key.to_string();
+        let watch_range_end = range_end.to_string();
+        let want_prev_kv = prev_kv;
         tokio::spawn(async move {
-            let watch_result = match backend.watch(&watch_key, start_revision).await {
+            let watch_result = match backend
+                .watch(&watch_key, &watch_range_end, start_revision)
+                .await
+            {
                 Ok(wr) => {
                     if wr.compact_revision != 0
                         && start_revision > 0
@@ -372,34 +379,7 @@ impl<B: Backend> KvBridge<B> {
                 }
                 let proto_events: Vec<_> = all_events
                     .iter()
-                    .map(|e| {
-                        let event_type = if e.delete {
-                            crate::proto::mvccpb::event::EventType::Delete
-                        } else {
-                            crate::proto::mvccpb::event::EventType::Put
-                        };
-                        crate::proto::mvccpb::Event {
-                            r#type: event_type.into(),
-                            kv: Some(crate::proto::mvccpb::KeyValue {
-                                key: e.kv.key.as_bytes().to_vec(),
-                                value: e.kv.value.clone(),
-                                create_revision: e.kv.create_revision,
-                                mod_revision: e.kv.mod_revision,
-                                version: e.kv.version,
-                                lease: e.kv.lease,
-                            }),
-                            prev_kv: e.prev_kv.as_ref().map(|pk| {
-                                crate::proto::mvccpb::KeyValue {
-                                    key: pk.key.as_bytes().to_vec(),
-                                    value: pk.value.clone(),
-                                    create_revision: pk.create_revision,
-                                    mod_revision: pk.mod_revision,
-                                    version: pk.version,
-                                    lease: pk.lease,
-                                }
-                            }),
-                        }
-                    })
+                    .map(|e| crate::server::watch::event_to_proto(e, want_prev_kv))
                     .collect();
                 let last_rev = all_events.last().map(|e| e.kv.mod_revision).unwrap_or(0);
                 if last_rev >= start_revision || start_revision == 0 {

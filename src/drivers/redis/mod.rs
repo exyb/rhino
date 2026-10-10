@@ -31,7 +31,9 @@ use redis::{AsyncCommands, Client, Script};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::{debug, error, trace, warn};
 
-use crate::backend::{Backend, BackendError, Event, KeyValue, Result, WatchResult};
+use crate::backend::{
+    Backend, BackendError, Event, KeyValue, Result, WatchResult, key_in_watch_range,
+};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const COMPACT_INTERVAL: Duration = Duration::from_secs(300);
@@ -611,6 +613,22 @@ impl RedisBackend {
         Ok(())
     }
 
+    /// Returns true when every revision in `[from, to)` exists in the log
+    /// (including rows hidden from `after()`, e.g. APISIX `init_dir`
+    /// markers). The poll loop uses this to tell a real gap from a span of
+    /// hidden-but-present revisions, which must advance the cursor silently.
+    async fn revisions_present(&self, from: i64, to: i64) -> Result<bool> {
+        let mut conn = self.conn.clone();
+        let count: i64 = redis::cmd("ZCOUNT")
+            .arg(log_key(&self.config.kine_table_name))
+            .arg(from)
+            .arg(format!("({to}"))
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| BackendError::Internal(e.to_string()))?;
+        Ok(count == to - from)
+    }
+
     /// Get the current (max) revision.
     async fn db_current_revision(&self) -> Result<i64> {
         let mut conn = self.conn.clone();
@@ -1113,7 +1131,20 @@ impl RedisBackend {
                         "revision gap: expected {next}, got {}",
                         event.kv.mod_revision
                     );
-                    if skip == next && skip_time.elapsed() > Duration::from_secs(1) {
+                    if self
+                        .revisions_present(next, event.kv.mod_revision)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        // All revisions in the span exist but are hidden from
+                        // after() (e.g. APISIX init_dir markers): nothing was
+                        // lost, so advance the cursor past them silently.
+                        trace!(
+                            "advancing past {} hidden revisions before rev {}",
+                            event.kv.mod_revision - next,
+                            event.kv.mod_revision
+                        );
+                    } else if skip == next && skip_time.elapsed() > Duration::from_secs(1) {
                         // Gap persisted beyond timeout — skip past it by filling
                         // and re-polling so the poll loop doesn't stall forever.
                         warn!(
@@ -1814,7 +1845,7 @@ impl Backend for RedisBackend {
         ))
     }
 
-    async fn watch(&self, key: &str, revision: i64) -> Result<WatchResult> {
+    async fn watch(&self, key: &str, range_end: &str, revision: i64) -> Result<WatchResult> {
         self.ensure_background_tasks();
 
         let (tx, rx) = mpsc::channel(100);
@@ -1827,7 +1858,8 @@ impl Backend for RedisBackend {
         }
 
         let mut broadcast_rx = self.broadcaster.subscribe().await;
-        let prefix = key.to_string();
+        let start_key = key.to_string();
+        let end_key = range_end.to_string();
         let start_rev = if revision > 0 { revision - 1 } else { 0 };
 
         let backend = Arc::new(RedisBackend {
@@ -1848,16 +1880,11 @@ impl Backend for RedisBackend {
             if start_rev > 0
                 && let Ok(events) = backend.after(start_rev, 0).await
             {
-                let check_prefix = prefix.ends_with('/');
                 let filtered: Vec<Event> = events
                     .into_iter()
                     .filter(|e| {
                         !e.kv.key.starts_with("gap-")
-                            && if check_prefix {
-                                e.kv.key.starts_with(&prefix)
-                            } else {
-                                e.kv.key == prefix
-                            }
+                            && key_in_watch_range(&start_key, &end_key, &e.kv.key)
                     })
                     .collect();
 
@@ -1871,9 +1898,9 @@ impl Backend for RedisBackend {
                 }
             }
 
-            // Stream live events, filtering by prefix and deduplicating
-            // against events already delivered from the historical query.
-            let check_prefix = prefix.ends_with('/');
+            // Stream live events, filtering by the requested key range and
+            // deduplicating against events already delivered from the
+            // historical query.
             loop {
                 match broadcast_rx.recv().await {
                     Some(events) => {
@@ -1881,11 +1908,7 @@ impl Backend for RedisBackend {
                             .iter()
                             .filter(|e| {
                                 e.kv.mod_revision > last_seen_rev
-                                    && if check_prefix {
-                                        e.kv.key.starts_with(&prefix)
-                                    } else {
-                                        e.kv.key == prefix
-                                    }
+                                    && key_in_watch_range(&start_key, &end_key, &e.kv.key)
                             })
                             .cloned()
                             .collect();

@@ -230,7 +230,7 @@ async fn test_backend_watch() {
     let (_, _, _) = b.delete("/test/a", rev1).await.unwrap();
     let (_, _, _) = b.update("/test/a/1", &[], rev2, 0).await.unwrap();
 
-    let wr = b.watch("/", base_rev + 1).await.unwrap();
+    let wr = b.watch("/", "", base_rev + 1).await.unwrap();
     let mut events_rx = wr.events;
 
     let mut all_events = Vec::new();
@@ -248,7 +248,7 @@ async fn test_backend_watch() {
         all_events.len()
     );
 
-    let wr = b.watch("/test/a/", base_rev + 1).await.unwrap();
+    let wr = b.watch("/test/a/", "", base_rev + 1).await.unwrap();
     let mut events_rx = wr.events;
 
     let mut prefix_events = Vec::new();

@@ -15,7 +15,9 @@ use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions};
 use tokio::sync::{Notify, broadcast, mpsc};
 use tracing::{debug, error, trace, warn};
 
-use crate::backend::{Backend, BackendError, Event, KeyValue, Result, WatchResult};
+use crate::backend::{
+    Backend, BackendError, Event, KeyValue, Result, WatchResult, common_prefix, key_in_watch_range,
+};
 
 const COMPACT_REV_KEY: &str = "compact_rev_key";
 const COMPACT_MIN_RETAIN: i64 = 1000;
@@ -77,7 +79,11 @@ fn validate_table_name(name: &str) -> Result<()> {
 pub struct MysqlBackend {
     pool: MySqlPool,
     current_rev: AtomicI64,
-    notify: Notify,
+    /// Shared with the poll loop task so `insert`/`update`/`delete` calls via
+    /// `notify_waiters()` wake the poll loop immediately instead of waiting for
+    /// the next poll tick. Must be an `Arc` — a fresh `Notify` per task would
+    /// silently lose every wakeup.
+    notify: Arc<Notify>,
     broadcast_tx: broadcast::Sender<Vec<Event>>,
     /// Broadcasts the revision that the poll loop has processed up to.
     polled_rev: Arc<tokio::sync::watch::Sender<i64>>,
@@ -106,7 +112,7 @@ impl MysqlBackend {
         Ok(Self {
             pool,
             current_rev: AtomicI64::new(0),
-            notify: Notify::new(),
+            notify: Arc::new(Notify::new()),
             broadcast_tx,
             polled_rev: Arc::new(polled_rev_tx),
             config,
@@ -241,6 +247,23 @@ impl MysqlBackend {
         .await
         .map_err(|e| BackendError::Internal(e.to_string()))?;
         Ok(())
+    }
+
+    /// Returns true when every revision in `[from, to)` exists in the kine
+    /// table. The poll loop uses this to tell a real gap (rows lost) from a
+    /// span of rows that exist but are hidden from `after()` (e.g. APISIX
+    /// `init_dir` markers): the latter must advance the cursor silently.
+    async fn revisions_present(&self, from: i64, to: i64) -> Result<bool> {
+        let row: (i64,) = sqlx::query_as(&format!(
+            "SELECT CAST(COUNT(*) AS SIGNED) FROM {} WHERE id >= ? AND id < ?",
+            self.config.kine_table_name
+        ))
+        .bind(from)
+        .bind(to)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| BackendError::Internal(e.to_string()))?;
+        Ok(row.0 == to - from)
     }
 
     async fn db_current_revision(&self) -> Result<i64> {
@@ -554,10 +577,13 @@ impl MysqlBackend {
         let mut skip_time = tokio::time::Instant::now();
 
         loop {
-            tokio::select! {
-                _ = interval.tick() => {},
-                _ = self.notify.notified() => {},
-            }
+            // Create the notified() future BEFORE querying so that any
+            // notify_waiters() from insert/update/delete that lands while the
+            // query is in flight is not lost — otherwise the wakeup waits for
+            // the next 1s interval tick (Notify::notify_waiters stores no
+            // permit for waiters that were not yet registered).
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
 
             // Update polled revision before querying (matching kine sql.go:504-508).
             let _ = self.polled_rev.send(poll_revision);
@@ -566,11 +592,19 @@ impl MysqlBackend {
                 Ok(r) => r,
                 Err(e) => {
                     error!("poll error: {e}");
+                    tokio::select! {
+                        _ = interval.tick() => {},
+                        _ = &mut notified => {},
+                    }
                     continue;
                 }
             };
 
             if events.is_empty() {
+                tokio::select! {
+                    _ = interval.tick() => {},
+                    _ = &mut notified => {},
+                }
                 continue;
             }
 
@@ -586,7 +620,20 @@ impl MysqlBackend {
                         "revision gap: expected {next}, got {}",
                         event.kv.mod_revision
                     );
-                    if skip == next && skip_time.elapsed() > Duration::from_secs(1) {
+                    if self
+                        .revisions_present(next, event.kv.mod_revision)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        // All revisions in the span exist but are hidden from
+                        // after() (e.g. APISIX init_dir markers): nothing was
+                        // lost, so advance the cursor past them silently.
+                        trace!(
+                            "advancing past {} hidden revisions before rev {}",
+                            event.kv.mod_revision - next,
+                            event.kv.mod_revision
+                        );
+                    } else if skip == next && skip_time.elapsed() > Duration::from_secs(1) {
                         error!(
                             "skipping revision gap at {next}, current event rev={}",
                             event.kv.mod_revision
@@ -776,7 +823,9 @@ impl Backend for MysqlBackend {
         let poll_self = Arc::new(MysqlBackend {
             pool: self.pool.clone(),
             current_rev: AtomicI64::new(self.current_rev.load(Ordering::Acquire)),
-            notify: Notify::new(),
+            // Share the Notify with the request-handling instance so that
+            // insert/update/delete calls wake the poll loop immediately.
+            notify: self.notify.clone(),
             broadcast_tx: self.broadcast_tx.clone(),
             polled_rev: self.polled_rev.clone(),
             config: self.config.clone(),
@@ -785,7 +834,7 @@ impl Backend for MysqlBackend {
         let compact_self = Arc::new(MysqlBackend {
             pool: self.pool.clone(),
             current_rev: AtomicI64::new(0),
-            notify: Notify::new(),
+            notify: self.notify.clone(),
             broadcast_tx: self.broadcast_tx.clone(),
             polled_rev: self.polled_rev.clone(),
             config: self.config.clone(),
@@ -997,7 +1046,7 @@ impl Backend for MysqlBackend {
         }
     }
 
-    async fn watch(&self, key: &str, revision: i64) -> Result<WatchResult> {
+    async fn watch(&self, key: &str, range_end: &str, revision: i64) -> Result<WatchResult> {
         let (tx, rx) = mpsc::channel(100);
 
         let current_rev = self.cached_revision().await?;
@@ -1008,17 +1057,32 @@ impl Backend for MysqlBackend {
         }
 
         let mut broadcast_rx = self.broadcast_tx.subscribe();
-        let prefix = key.to_string();
+        let start_key = key.to_string();
+        let end_key = range_end.to_string();
         let start_rev = if revision > 0 { revision - 1 } else { 0 };
         let pool = self.pool.clone();
         let kine_table_name = self.config.kine_table_name.clone();
 
         tokio::spawn(async move {
             if start_rev > 0 {
-                let after_prefix = if prefix.ends_with('/') {
-                    format!("{prefix}%")
+                // SQL-level prefilter (a superset of the requested range). The
+                // exact `[start, range_end)` semantics are applied in Rust below
+                // via `key_in_watch_range`, since SQL string comparison follows
+                // the database collation rather than etcd's byte order.
+                let (name_cond, name_bind) = if end_key.is_empty() {
+                    let pattern = if start_key.ends_with('/') {
+                        format!("{start_key}%")
+                    } else {
+                        start_key.clone()
+                    };
+                    ("kv.name LIKE ? ESCAPE '^'", pattern)
+                } else if end_key == "\0" {
+                    ("kv.name >= ?", start_key.clone())
                 } else {
-                    prefix.clone()
+                    (
+                        "kv.name LIKE ? ESCAPE '^'",
+                        format!("{}%", common_prefix(&start_key, &end_key)),
+                    )
                 };
 
                 let sql = format!(
@@ -1035,7 +1099,7 @@ impl Backend for MysqlBackend {
                         kv.value,
                         kv.old_value
                     FROM {} AS kv
-                    WHERE kv.name LIKE ? ESCAPE '^' AND kv.id > ?
+                    WHERE {name_cond} AND kv.id > ?
                     AND (kv.value IS NULL OR kv.value != ?)
                     ORDER BY kv.id ASC",
                     kine_table_name,
@@ -1044,7 +1108,7 @@ impl Backend for MysqlBackend {
                 );
 
                 if let Ok(rows) = sqlx::query(&sql)
-                    .bind(&after_prefix)
+                    .bind(&name_bind)
                     .bind(start_rev)
                     .bind(INIT_DIR_MARKER)
                     .fetch_all(&pool)
@@ -1063,6 +1127,10 @@ impl Backend for MysqlBackend {
                         let old_value: Vec<u8> = row.try_get(10).unwrap_or_default();
 
                         if name.starts_with("gap-") {
+                            continue;
+                        }
+                        // Narrow the SQL prefilter to the exact key range.
+                        if !key_in_watch_range(&start_key, &end_key, &name) {
                             continue;
                         }
 
@@ -1106,19 +1174,13 @@ impl Backend for MysqlBackend {
                 }
             }
 
-            let check_prefix = prefix.ends_with('/');
+            // Stream live events, filtering by the requested key range.
             loop {
                 match broadcast_rx.recv().await {
                     Ok(events) => {
                         let filtered: Vec<Event> = events
                             .into_iter()
-                            .filter(|e| {
-                                if check_prefix {
-                                    e.kv.key.starts_with(&prefix)
-                                } else {
-                                    e.kv.key == prefix
-                                }
-                            })
+                            .filter(|e| key_in_watch_range(&start_key, &end_key, &e.kv.key))
                             .collect();
                         if !filtered.is_empty() && tx.send(filtered).await.is_err() {
                             return;

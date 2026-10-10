@@ -230,7 +230,7 @@ async fn test_backend_watch() {
     let (_, _, _) = b.delete("/test/a", rev1).await.unwrap();
     let (_, _, _) = b.update("/test/a/1", &[], rev2, 0).await.unwrap();
 
-    let wr = b.watch("/", base_rev + 1).await.unwrap();
+    let wr = b.watch("/", "", base_rev + 1).await.unwrap();
     let mut events_rx = wr.events;
 
     let mut all_events = Vec::new();
@@ -248,7 +248,7 @@ async fn test_backend_watch() {
         all_events.len()
     );
 
-    let wr = b.watch("/test/a/", base_rev + 1).await.unwrap();
+    let wr = b.watch("/test/a/", "", base_rev + 1).await.unwrap();
     let mut events_rx = wr.events;
 
     let mut prefix_events = Vec::new();
@@ -349,7 +349,7 @@ async fn test_watch_live_events() {
 
     let current_rev = b.current_revision().await.unwrap();
 
-    let watch_result = b.watch("/watch/", current_rev + 1).await.unwrap();
+    let watch_result = b.watch("/watch/", "", current_rev + 1).await.unwrap();
     let mut events_rx = watch_result.events;
 
     b.create("/watch/key1", b"hello", 0).await.unwrap();
@@ -369,7 +369,7 @@ async fn test_watch_live_create_update_delete() {
     let current_rev = b.current_revision().await.unwrap();
 
     // Start watching BEFORE mutations happen — mirrors Kubernetes apiserver pattern
-    let watch_result = b.watch("/wlive/", current_rev + 1).await.unwrap();
+    let watch_result = b.watch("/wlive/", "", current_rev + 1).await.unwrap();
     let mut events_rx = watch_result.events;
 
     // Create

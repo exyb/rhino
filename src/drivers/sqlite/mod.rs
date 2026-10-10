@@ -18,7 +18,9 @@ use sqlx::sqlite::{
 use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::{debug, error, trace, warn};
 
-use crate::backend::{Backend, BackendError, Event, KeyValue, Result, WatchResult};
+use crate::backend::{
+    Backend, BackendError, Event, KeyValue, Result, WatchResult, common_prefix, key_in_watch_range,
+};
 
 const COMPACT_REV_KEY: &str = "compact_rev_key";
 const COMPACT_MIN_RETAIN: i64 = 1000;
@@ -493,6 +495,23 @@ impl SqliteBackend {
     /// Query rows after a given revision for the poll loop.
     /// Uses a simple `id > ?` scan on the primary key — no LIKE filter needed
     /// since the poll loop processes all keys.
+    /// Returns true when every revision in `[from, to)` exists in the kine
+    /// table. The poll loop uses this to tell a real gap (rows lost) from a
+    /// span of rows that exist but are hidden from `after()` (e.g. APISIX
+    /// `init_dir` markers): the latter must advance the cursor silently.
+    async fn revisions_present(&self, from: i64, to: i64) -> Result<bool> {
+        let row: (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM {} WHERE id >= ? AND id < ?",
+            self.config.kine_table_name
+        ))
+        .bind(from)
+        .bind(to)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| BackendError::Internal(e.to_string()))?;
+        Ok(row.0 == to - from)
+    }
+
     async fn after(&self, revision: i64, limit: i64) -> Result<Vec<Event>> {
         let limit_clause = if limit > 0 {
             format!("LIMIT {limit}")
@@ -793,7 +812,20 @@ impl SqliteBackend {
                         "revision gap: expected {next}, got {}",
                         event.kv.mod_revision
                     );
-                    if skip == next && skip_time.elapsed() > Duration::from_secs(1) {
+                    if self
+                        .revisions_present(next, event.kv.mod_revision)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        // All revisions in the span exist but are hidden from
+                        // after() (e.g. APISIX init_dir markers): nothing was
+                        // lost, so advance the cursor past them silently.
+                        trace!(
+                            "advancing past {} hidden revisions before rev {}",
+                            event.kv.mod_revision - next,
+                            event.kv.mod_revision
+                        );
+                    } else if skip == next && skip_time.elapsed() > Duration::from_secs(1) {
                         // Gap persisted too long, skip it
                         error!(
                             "skipping revision gap at {next}, current event rev={}",
@@ -1395,7 +1427,7 @@ impl Backend for SqliteBackend {
         }
     }
 
-    async fn watch(&self, key: &str, revision: i64) -> Result<WatchResult> {
+    async fn watch(&self, key: &str, range_end: &str, revision: i64) -> Result<WatchResult> {
         // Start background tasks lazily on first watch (matching kine's startWatch)
         self.ensure_background_tasks();
 
@@ -1411,7 +1443,8 @@ impl Backend for SqliteBackend {
         }
 
         let mut broadcast_rx = self.broadcaster.subscribe().await;
-        let prefix = key.to_string();
+        let start_key = key.to_string();
+        let end_key = range_end.to_string();
 
         // First, send any historical events since the requested revision
         let start_rev = if revision > 0 { revision - 1 } else { 0 };
@@ -1425,10 +1458,24 @@ impl Backend for SqliteBackend {
 
             // Fetch historical events
             if start_rev > 0 {
-                let after_prefix = if prefix.ends_with('/') {
-                    format!("{prefix}%")
+                // SQL-level prefilter (a superset of the requested range). The
+                // exact `[start, range_end)` semantics are applied in Rust below
+                // via `key_in_watch_range`, since SQL string comparison follows
+                // the database collation rather than etcd's byte order.
+                let (name_cond, name_bind) = if end_key.is_empty() {
+                    let pattern = if start_key.ends_with('/') {
+                        format!("{start_key}%")
+                    } else {
+                        start_key.clone()
+                    };
+                    ("kv.name LIKE ? ESCAPE '^'", pattern)
+                } else if end_key == "\0" {
+                    ("kv.name >= ?", start_key.clone())
                 } else {
-                    prefix.clone()
+                    (
+                        "kv.name LIKE ? ESCAPE '^'",
+                        format!("{}%", common_prefix(&start_key, &end_key)),
+                    )
                 };
 
                 let sql = format!(
@@ -1443,13 +1490,13 @@ impl Backend for SqliteBackend {
                         kv.value,
                         kv.old_value
                     FROM {} AS kv
-                    WHERE kv.name LIKE ? ESCAPE '^' AND kv.id > ?
+                    WHERE {name_cond} AND kv.id > ?
                     ORDER BY kv.id ASC",
                     kine_table_name
                 );
 
                 if let Ok(rows) = sqlx::query(&sql)
-                    .bind(&after_prefix)
+                    .bind(&name_bind)
                     .bind(start_rev)
                     .fetch_all(&pool)
                     .await
@@ -1467,6 +1514,10 @@ impl Backend for SqliteBackend {
                         let old_value: Vec<u8> = row.try_get(8).unwrap_or_default();
 
                         if name.starts_with("gap-") {
+                            continue;
+                        }
+                        // Narrow the SQL prefilter to the exact key range.
+                        if !key_in_watch_range(&start_key, &end_key, &name) {
                             continue;
                         }
 
@@ -1522,9 +1573,9 @@ impl Backend for SqliteBackend {
                 }
             }
 
-            // Stream live events, filtering by prefix and deduplicating
-            // against events already delivered from the historical query.
-            let check_prefix = prefix.ends_with('/');
+            // Stream live events, filtering by the requested key range and
+            // deduplicating against events already delivered from the
+            // historical query.
             loop {
                 match broadcast_rx.recv().await {
                     Some(events) => {
@@ -1532,11 +1583,7 @@ impl Backend for SqliteBackend {
                             .iter()
                             .filter(|e| {
                                 e.kv.mod_revision > last_seen_rev
-                                    && if check_prefix {
-                                        e.kv.key.starts_with(&prefix)
-                                    } else {
-                                        e.kv.key == prefix
-                                    }
+                                    && key_in_watch_range(&start_key, &end_key, &e.kv.key)
                             })
                             .cloned()
                             .collect();
