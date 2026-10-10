@@ -1,6 +1,6 @@
 # Watch 变更通知修复总结
 
-> 日期：2026-10-10 ｜ 分支：`fix/watch-notify`（基于 `apisix3` @ aa9f23a）｜ 状态：**已提交**（本文件与代码同分支提交，工作树 `rhino-fix-watch`）
+> 日期：2026-10-10 ｜ 分支：`fix/watch-notify`（基于 `apisix3` @ aa9f23a）｜ 状态：**已合并进 `apisix3`**（`1773363` fast-forward）
 > 变更规模：12 个代码文件，+750 / −170；影响全部 4 个驱动（MySQL / PostgreSQL / SQLite / Redis）
 > 修复分两批：第一批解决「收不到通知 + 伪 gap」（症状 1/2）；第二批解决「prev_kv 无条件附带导致的『冗余一条』显示」（症状 3，见 §2.3）
 
@@ -148,9 +148,9 @@ kine 日志表的 revision 就是自增 `id`，poll 回路按「rev+1, rev+2…�
 
 修复必须运行**新构建的二进制**才生效（重启 rhino）：
 
-1. 临时验证：直接使用 worktree 构建产物
-   `/home/bobo/Files/Work/repo-public/github/rhino-fix-watch/target/debug/rhino-server`；
-2. 正式落地：将 `fix/watch-notify` 合并/变基到 `apisix3`，重新构建并重启服务。
+1. 代码已合并进 `apisix3`（`1773363`，fast-forward）；在主仓库重新构建：
+   `cargo build`，产物位于 `target/debug/rhino-server`；
+2. 用新二进制重启 rhino 即生效（旧二进制仍会复现全部三个症状）。
 
 ## 6. 变更清单
 
